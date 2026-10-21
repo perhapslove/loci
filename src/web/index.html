@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Loci · 地灵</title>
+<meta name="description" content="A pocket spirit of place that sees where you are and tells you the city's stories. Open-source AI hardware for gamified cultural city exploration.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='30' fill='%23142a2a'/><circle cx='23' cy='30' r='6' fill='%23e8d9a8'/><circle cx='41' cy='30' r='6' fill='%23e8d9a8'/></svg>">
+<style>
+:root{--bg:#f4efe4;--ink:#1d2423;--muted:#5f6b67;--line:#d9d0bd;--accent:#1f5c58;--card:#fbf8f1}
+@media (prefers-color-scheme:dark){:root{--bg:#101716;--ink:#ece6d6;--muted:#9aa7a2;--line:#2a3533;--accent:#8fc7bd;--card:#161f1e}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.65 ui-serif,"Iowan Old Style","Songti SC","Noto Serif SC",Georgia,serif}
+main{max-width:760px;margin:0 auto;padding:56px 20px 80px}
+.mark{display:flex;gap:14px;margin-bottom:28px}
+.eye{width:34px;height:34px;border-radius:50%;background:var(--ink);position:relative;animation:blink 6s infinite}
+.eye::after{content:"";position:absolute;width:12px;height:12px;border-radius:50%;background:var(--bg);top:9px;left:13px}
+@keyframes blink{0%,94%,100%{transform:scaleY(1)}96%{transform:scaleY(.1)}}
+h1{font-size:44px;line-height:1.1;margin:0 0 6px;letter-spacing:-.5px}
+h1 span{color:var(--muted);font-weight:400}
+.lede{font-size:21px;margin:14px 0 6px}
+.zh{color:var(--muted)}
+h2{font-size:15px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:52px 0 12px;font-family:ui-sans-serif,-apple-system,"PingFang SC",sans-serif}
+ol{padding-left:22px}li{margin:6px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:12px 0}
+.card b{display:block;margin-bottom:2px}
+.quote{border-left:3px solid var(--accent);padding:4px 0 4px 16px;margin:24px 0;color:var(--muted);font-style:italic}
+a{color:var(--accent)}
+.btn{display:inline-block;margin-top:18px;padding:10px 18px;border-radius:999px;background:var(--ink);color:var(--bg);text-decoration:none;font-family:ui-sans-serif,-apple-system,sans-serif;font-size:15px}
+footer{margin-top:64px;font-size:14px;color:var(--muted);font-family:ui-sans-serif,-apple-system,"PingFang SC",sans-serif}
+</style>
+</head>
+<body>
+<main>
+  <div class="mark" aria-hidden="true"><div class="eye"></div><div class="eye"></div></div>
+  <h1>Loci <span>· 地灵</span></h1>
+  <p class="lede">A pocket spirit of place that sees where you are and tells you the city's stories.</p>
+  <p class="zh">一只会看、会说的口袋地灵，陪你在城市里解谜，讲这个地方的故事。</p>
+  <a class="btn" href="https://github.com/perhapslove/loci">Source on GitHub</a>
+
+  <p class="quote"><em>Genius loci</em> — the spirit of a place. 人杰地灵. Every city has one.</p>
+
+  <h2>How it plays</h2>
+  <ol>
+    <li>A clue sends you into the streets: find the date carved on a gate, the name on a stone.</li>
+    <li>Point your spirit at what you found. It looks.</li>
+    <li>If you're really there and you got it right, it tells you that place's story — and the next clue.</li>
+  </ol>
+  <p class="zh">答案只在现场。AI 搜不到，地灵得看见你真的在那里。</p>
+
+  <h2>What it's made of</h2>
+  <div class="card"><b>A body that sees and speaks</b>Seeed SenseCAP Watcher — a round screen with eyes, a camera, a microphone, a speaker. Or a thumb-sized XIAO ESP32S3 Sense for wearables.</div>
+  <div class="card"><b>A brain that judges</b>A small open-source relay asks a vision model one question — <em>did they find it?</em> — and turns the story into speech.</div>
+  <div class="card"><b>A route you can write</b>Each route is a plain file: stations, riddles, targets, stories. The stories are written by people, not generated.</div>
+
+  <h2>Status</h2>
+  <p>Prototype. Started at the Seeed × ShanHaiWoo AI Hardware Hackathon, Shenzhen, October 2026. Open source under the MIT license.</p>
+  <p class="zh">原型阶段，起于 2026 年 10 月深圳 Seeed × 山海坞 AI 硬件创客松。MIT 开源。</p>
+
+  <footer>Loci · made in Shenzhen · <a href="https://github.com/perhapslove/loci">github.com/perhapslove/loci</a></footer>
+</main>
+</body>
+</html>

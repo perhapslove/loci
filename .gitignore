@@ -1,0 +1,47 @@
+# 过程材料：用完即弃，坚决不进版本库
+_build/
+_tmp/
+_work/
+# 系统噪音
+.DS_Store
+*.swp
+# 密钥：只准落文件路径，值永不进库
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+# 大文件走 Git LFS，不直接进库
+*.zip
+*.tar.gz
+
+# ── 本机工作层（local-only working files）：不进公开仓库 ──
+_private/
+_archive/
+.42cog/
+state/
+notes/
+vault/
+hi.md
+CLAUDE.md
+.claude/
+.claudeignore
+plugin.json
+42plugin.json
+init-log.txt
+scripts/aias*
+scripts/lib/
+specs/must-know.md
+
+# ── 运行时产物 ──
+src/firmware/**/secrets.h
+src/firmware/**/build/
+src/relay/captures/
+__pycache__/
+*.pyc
+.wrangler/
+node_modules/
+.dev.vars
+
+# 空目录占位
+.keep
