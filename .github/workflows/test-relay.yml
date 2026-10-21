@@ -1,0 +1,23 @@
+# Run the relay tests on every push and pull request. No secrets needed.
+name: Test relay
+
+on:
+  push:
+    paths: ["src/relay/**", ".github/workflows/test-relay.yml"]
+  pull_request:
+    paths: ["src/relay/**", ".github/workflows/test-relay.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests (no hardware, no model calls)
+        working-directory: src/relay
+        run: python -m unittest -v test_relay
