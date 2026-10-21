@@ -25,9 +25,10 @@ Source: <https://wiki.seeedstudio.com/watcher_hardware_overview/>
 Source: `SenseCAP-Watcher-Firmware/examples/factory_firmware/main/task_flow_module/tf_module_img_analyzer.{c,h}` (path at lines 44/47 of the header), `tf_module_local_alarm.c` (playback), `app/app_audio_player.c` (WAV header check).
 
 **Pitfalls**
-- The SenseCraft cloud free tier limits cloud image analysis (about once per 15 minutes per the pricing page). Whether a self-hosted Device AI Service is limited too is untested.
+- The SenseCraft cloud free tier allows one cloud image analysis per 15 minutes; a SenseCraft Pro trial (20,000 requests) starts when the device is bound; the self-hosted service is listed as unlimited ([pricing page](https://wiki.seeedstudio.com/watcher_price/)). In the app the setting is called *Watcher AI Service → Private Watcher Service*.
 - Before flashing any other firmware (e.g. xiaozhi), back up the factory `nvsfactory` partition first, or the device may not reconnect to SenseCraft afterwards.
-- Tasks are normally triggered by the on-device model first; how to trigger on a button press or timer is still to be confirmed.
+- How a task is triggered depends on its object ([task guide](https://wiki.seeedstudio.com/getting_started_with_watcher_task/)): objects with an on-device model (person, cat/dog, "paper" hand gesture) trigger locally in ~2 s; objects without one (e.g. "a sign that says …") run in pure-LLM mode and send a photo every *Capture Frequency*. The guide says at least 60 s; in Oct 2026 the app proposed 30 s. Verified: a "sign" task reached `/v1/watcher/vision` on the self-hosted relay.
+- A task only starts after you tap **Run** on its card in the app; **Detail Config** sets the action (RGB light, speaker, notification) and the capture frequency. Push-to-talk (hold the wheel) is English-only.
 
 ## Seeed XIAO ESP32S3 Sense — eyes and ears for wearables
 
