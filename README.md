@@ -34,9 +34,11 @@ The answer only exists on site. An AI can't search it — the creature has to *s
 |---|---|
 | `src/relay/` | The brain. Receives photos, asks a vision model whether the player found the target, returns speech. Includes the endpoint the SenseCAP Watcher's stock firmware calls (`/v1/watcher/vision`) and a web page for the route. |
 | `src/relay/stations.json` | A route: stations, riddles, targets, stories. Edit this, not the code. |
+| `src/relay/test_relay.py` | Tests for the relay — no hardware, no model calls: `python3 -m unittest -v test_relay` |
 | `src/firmware/xiao-senses/` | Firmware for XIAO ESP32S3 Sense: press BOOT to snap and upload; hold to record audio. |
 | `docs/hardware.md` | What each supported device can and can't do, with sources. |
 | `docs/getting-started.md` | Step-by-step: run the relay, connect a Watcher, flash a XIAO. |
+| `docs/api.md` | Every endpoint the relay serves, for devices and other clients. |
 
 ## Quick start
 

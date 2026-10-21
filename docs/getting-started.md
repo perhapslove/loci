@@ -15,7 +15,7 @@ cd src/relay
 python3 relay.py
 ```
 
-Open <http://localhost:8787/>. You should see the first station of the demo route.
+Open <http://localhost:8787/>. You should see the first station of the demo route, and three device slots at the top — Watcher, XIAO, glasses. Each slot turns green the moment that device reaches the relay, so connect them one at a time and watch.
 Find the Mac's address on the shared network — devices will need it:
 
 ```sh
