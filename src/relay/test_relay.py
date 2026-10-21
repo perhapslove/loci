@@ -102,6 +102,17 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(s["solved"], [1])
         self.assertTrue(s["unlocked"])
 
+    def test_watcher_vision_quiet_after_station_solved(self):
+        calls = []
+        relay.ask_model = lambda jpeg, station, path: calls.append(1) or {"match": True, "text": "找到了", "source": "test"}
+        relay.tts_wav = lambda text: FAKE_WAV
+        body = json.dumps({"img": base64.b64encode(JPEG).decode(), "type": 1})
+        _, first = self.req("POST", "/v1/watcher/vision", body, {"Content-Type": "application/json"})
+        _, second = self.req("POST", "/v1/watcher/vision", body, {"Content-Type": "application/json"})
+        self.assertEqual(first["data"]["state"], 1)
+        self.assertEqual(second["data"]["state"], 0)     # no retelling every capture
+        self.assertEqual(len(calls), 1)                   # and no model call for a solved station
+
     def test_glasses_photo_returns_verdict_synchronously(self):
         relay.ask_model = lambda jpeg, station, path: {"match": False, "text": "不是这个", "source": "test"}
         body = json.dumps({"img": base64.b64encode(JPEG).decode()})

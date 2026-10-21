@@ -210,7 +210,11 @@ def judge(fname: str, jpeg: bytes) -> dict:
     stations, _ = load_stations()
     with lock:
         idx = state["station"]
-    verdict = ask_model(jpeg, stations[idx], CAPTURES / fname)
+        already_solved = idx in state["solved"]
+    if already_solved:  # don't re-judge (or retell the story) until someone moves on
+        verdict = {"match": None, "text": "这一站已经解开了，点「下一站」继续。", "source": "skip"}
+    else:
+        verdict = ask_model(jpeg, stations[idx], CAPTURES / fname)
     with lock:
         if state["photo"] == fname:  # only if no newer photo arrived meanwhile
             state["verdict"] = verdict
