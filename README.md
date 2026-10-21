@@ -6,7 +6,7 @@ Gamified cultural exploration of cities, built from cheap AI hardware and open-s
 > *Genius loci* — the protective spirit of a place. In Chinese, 人杰地灵: great people come from places with spirit.
 > Every city has one. Loci is how you meet it.
 
-**Status:** prototype, started at the Seeed × ShanHaiWoo AI Hardware Hackathon (Shenzhen, Oct 21–23, 2026). Expect rough edges.
+**Website:** <https://loci.goshimmer.ai> · **Status:** prototype, started at the Seeed × ShanHaiWoo AI Hardware Hackathon (Shenzhen, Oct 21–23, 2026). Expect rough edges.
 
 ---
 
