@@ -21,6 +21,19 @@ JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64 + b"\xff\xd9"
 FAKE_WAV = b"RIFF" + b"\x00" * 4 + b"WAVEfmt " + b"\x00" * 28
 
 
+def tone(seconds: float) -> bytes:
+    """Loud 16 kHz mono 16-bit PCM, like someone speaking close to the mic."""
+    n = int(16000 * seconds)
+    return struct.pack(f"<{n}h", *(8000 if (i // 20) % 2 else -8000 for i in range(n)))
+
+
+def talk_reply(body: bytes) -> tuple[dict, bytes]:
+    """Split a push-to-talk reply the way the Watcher does: JSON, boundary, one newline, audio."""
+    head, sep, rest = body.partition(b"---sensecraftboundary---")
+    assert sep, body[:200]
+    return json.loads(head), rest[1:]
+
+
 class RelayTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -34,13 +47,14 @@ class RelayTest(unittest.TestCase):
         shutil.rmtree(DATA, ignore_errors=True)
 
     def setUp(self):
-        self.real_ask, self.real_tts = relay.ask_model, relay.tts_wav
+        self.real = (relay.ask_model, relay.tts_wav, relay.transcribe, relay.ask_text, relay.ASR_URL)
         self.req("POST", "/reset")
         with relay.lock:
             relay.state["devices"].clear()
+            relay.talks.clear()
 
     def tearDown(self):
-        relay.ask_model, relay.tts_wav = self.real_ask, self.real_tts
+        relay.ask_model, relay.tts_wav, relay.transcribe, relay.ask_text, relay.ASR_URL = self.real
 
     def req(self, method, path, body=None, headers=None):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -129,6 +143,7 @@ class RelayTest(unittest.TestCase):
         self.assertTrue(full["photo"])
 
     def test_watcher_voice_chunked_body_is_saved(self):
+        relay.tts_wav = lambda text: FAKE_WAV
         payload = os.urandom(5000)
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         c.putrequest("POST", "/v2/watcher/talk/audio_stream")
@@ -141,13 +156,69 @@ class RelayTest(unittest.TestCase):
             c.send(b"%X\r\n" % len(part) + part + b"\r\n")
         c.send(b"0\r\n\r\n")
         r = c.getresponse()
-        resp = json.loads(r.read())
+        head, wav = talk_reply(r.read())
         c.close()
         self.assertEqual(r.status, 200)
-        self.assertEqual(resp["code"], 501)
+        self.assertEqual(head["code"], 200)
+        self.assertEqual(wav, FAKE_WAV)
         saved = sorted(p for p in os.listdir(DATA) if p.startswith("voice-") and p.endswith(".bin"))
         with open(os.path.join(DATA, saved[-1]), "rb") as f:
             self.assertEqual(f.read(), payload)
+
+    def test_tunnel_requests_only_reach_the_public_api(self):
+        cf = {"Cf-Connecting-Ip": "203.0.113.9"}
+        self.assertEqual(self.req("GET", "/", headers=cf)[0], 404)            # no web page
+        self.assertEqual(self.req("GET", "/state", headers=cf)[0], 404)       # no full state / log
+        self.assertEqual(self.req("GET", "/photo/x.jpg", headers=cf)[0], 404)  # no photos
+        self.assertEqual(self.req("POST", "/reset", headers=cf)[0], 404)      # no operator buttons
+        self.assertEqual(self.req("GET", "/api/v1/state", headers=cf)[0], 200)
+        self.assertEqual(self.req("GET", "/")[0], 200)                        # the local network still can
+
+    def test_talk_endpoint_answers_as_the_spirit(self):
+        relay.ask_text = lambda prompt: "去找一个人吧。"
+        st, r = self.req("POST", "/api/v1/talk?device=glasses-t", json.dumps({"text": "我该去哪"}),
+                         {"Content-Type": "application/json"})
+        self.assertEqual(st, 200)
+        self.assertEqual((r["heard"], r["reply"]), ("我该去哪", "去找一个人吧。"))
+        self.assertEqual(r["devices"]["glasses-t"]["kind"], "glasses")
+
+    def test_next_only_from_a_solved_station(self):
+        _, r = self.req("POST", "/api/v1/next")
+        self.assertEqual((r["moved"], r["station"]), (False, 1))
+        self.req("POST", "/judge?ok=1")
+        _, r = self.req("POST", "/api/v1/next")
+        self.assertEqual((r["moved"], r["station"]), (True, 2))
+
+    def test_voiced_seconds_tells_silence_from_speech(self):
+        self.assertEqual(relay.voiced_seconds(b"\x00\x00" * 16000), 0.0)
+        quiet_then_loud = struct.pack("<16000h", *([50] * 16000)) + tone(1.0)
+        self.assertGreater(relay.voiced_seconds(quiet_then_loud), 0.9)
+
+    def test_watcher_talk_silence_is_not_transcribed(self):
+        relay.tts_wav = lambda text: FAKE_WAV
+        relay.ASR_URL = "http://asr.invalid"
+        relay.transcribe = lambda pcm: self.fail("silence must not reach the ASR")
+        st, body = self.req("POST", "/v2/watcher/talk/audio_stream", b"\x00\x00" * 32000)
+        head, wav = talk_reply(body)
+        self.assertEqual(head["data"]["stt_result"], "")
+        self.assertIn("没听清", head["data"]["screen_text"])
+
+    def test_watcher_talk_answers_what_it_heard(self):
+        relay.tts_wav = lambda text: FAKE_WAV
+        relay.ASR_URL = "http://asr.invalid"
+        relay.transcribe = lambda pcm: "地灵你好"
+        prompts = []
+        relay.ask_text = lambda prompt: prompts.append(prompt) or "地灵：你好呀，去找山海坞吧。"
+        st, body = self.req("POST", "/v2/watcher/talk/audio_stream", tone(1.0))
+        head, wav = talk_reply(body)
+        self.assertEqual(st, 200)
+        self.assertEqual(head["data"]["mode"], 0)
+        self.assertEqual(head["data"]["stt_result"], "地灵你好")
+        self.assertEqual(head["data"]["screen_text"], "你好呀，去找山海坞吧。")
+        self.assertEqual(wav, FAKE_WAV)
+        self.assertIn("第1站", prompts[0])          # the spirit knows where the player is
+        self.req("POST", "/v2/watcher/talk/audio_stream", tone(1.0))
+        self.assertIn("你好呀", prompts[1])          # and remembers the last exchange
 
     def test_keepalive_two_posts_on_one_connection(self):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)

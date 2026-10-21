@@ -12,22 +12,31 @@ Judging backend, first that applies:
 
 Environment: RELAY_PORT, MODEL (default claude-sonnet-5-5), STATIONS (route file), JUDGE (manual),
 CLAUDE_PROXY (default http://127.0.0.1:7890), TTS_VOICE (default Tingting), WATCHER_TOKEN,
-WATCHER_SPEAK_MISS=1, LOCI_DATA (where photos/audio are stored; default ./captures).
+WATCHER_SPEAK_MISS=1, LOCI_DATA (where photos/audio are stored; default ./captures),
+ASR_URL / ASR_KEY / ASR_MODEL (an OpenAI-compatible /v1/audio/transcriptions endpoint, e.g. a local
+Whisper or Qwen-ASR server; without it the Watcher's push-to-talk gets a polite "I can't listen yet").
 
 Device endpoints (see docs/api.md):
     POST /upload                         XIAO ESP32S3 Sense: raw JPEG body, header X-Device
     POST /audio                          XIAO: raw WAV body
     POST /v1/watcher/vision              SenseCAP Watcher stock firmware, "Device AI Service"
     POST /v1/notification/event          SenseCAP Watcher HTTP push (task alarm with image)
-    POST /v2/watcher/talk/audio_stream   SenseCAP Watcher voice — recorded for inspection, not answered yet
+    POST /v2/watcher/talk/audio_stream   SenseCAP Watcher push-to-talk → the spirit answers out loud
     GET  /api/v1/state                   any client (glasses, phone): compact progress
     POST /api/v1/photo                   any client: JPEG (raw or JSON {img}) → verdict in the response
+    POST /api/v1/talk                    any client: {"text": "..."} → the spirit's reply
+    POST /api/v1/next                    any client: go to the next station, only once this one is solved
+
+Requests that arrive through a Cloudflare tunnel (they carry Cf-Connecting-Ip) may only use the
+/api/v1/* endpoints above; the web page, photos and operator buttons stay on the local network.
 """
 
+import array
 import base64
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -55,6 +64,13 @@ CLAUDE_PROXY = os.environ.get("CLAUDE_PROXY", "http://127.0.0.1:7890")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Tingting")
 WATCHER_TOKEN = os.environ.get("WATCHER_TOKEN", "")    # token set in the SenseCraft app; empty = don't check
 WATCHER_SPEAK_MISS = os.environ.get("WATCHER_SPEAK_MISS", "0") == "1"  # also speak on a miss (triggers the alarm)
+ASR_URL = os.environ.get("ASR_URL", "")
+ASR_KEY = os.environ.get("ASR_KEY", "")
+ASR_MODEL = os.environ.get("ASR_MODEL", "")
+MIN_VOICED_S = 0.3   # less voice than this and ASR models make up whole sentences, so ask again instead
+PUBLIC_PATHS = {"/api/v1/state", "/api/v1/photo", "/api/v1/talk", "/api/v1/next"}  # all a tunnel may reach
+SPIRIT = ("你是「地灵」，住在这座城市里的地方之灵，正被一位玩家带着在城里解谜。"
+          "用中文口语回答，像老朋友聊天，最多两句、40 个字以内。你的话会被念出来，所以不要表情符号、括号和列表。")
 
 # The three devices this project expects; the web page shows a slot for each.
 DEVICE_KINDS = {
@@ -75,6 +91,7 @@ state = {
     "devices": {},          # id → {kind, first_seen, last_seen, last_event, ip, count}
     "log": [],
 }
+talks = {}                  # device id → last few (heard, reply) pairs, so the spirit remembers the chat
 
 
 def load_stations():
@@ -278,6 +295,99 @@ def tts_wav(text: str) -> bytes:
     return data
 
 
+# ── talking to the spirit (Watcher push-to-talk) ─────────────────────────
+
+def voiced_seconds(pcm: bytes) -> float:
+    """Seconds of 30 ms frames clearly above the clip's noise floor (16 kHz mono 16-bit PCM)."""
+    a = array.array("h", pcm[: len(pcm) // 2 * 2])
+    rms = [math.sqrt(sum(x * x for x in a[i:i + 480]) / 480) for i in range(0, len(a) - 479, 480)]
+    if not rms:
+        return 0.0
+    threshold = min(1500, max(600, 2 * sorted(rms)[len(rms) // 10]))   # follows a noisy room, within limits
+    return sum(r > threshold for r in rms) * 0.03
+
+
+def transcribe(pcm: bytes) -> str:
+    """Speech → text through an OpenAI-compatible transcription endpoint (ASR_URL)."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(pcm[: 55 * 32000])            # keep under the usual 60 s request limit
+    b = "loci" + os.urandom(8).hex()
+    body = f'--{b}\r\nContent-Disposition: form-data; name="model"\r\n\r\n{ASR_MODEL}\r\n'.encode() if ASR_MODEL else b""
+    body += (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
+             f"Content-Type: audio/wav\r\n\r\n").encode() + buf.getvalue() + f"\r\n--{b}--\r\n".encode()
+    headers = {"Content-Type": f"multipart/form-data; boundary={b}"}
+    if ASR_KEY:
+        headers["Authorization"] = f"Bearer {ASR_KEY}"
+    no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # usually a local server
+    with no_proxy.open(urllib.request.Request(ASR_URL, data=body, headers=headers), timeout=60) as r:
+        return json.loads(r.read()).get("text", "").strip()
+
+
+def ask_text(prompt: str) -> str:
+    """A short text answer from the same backend the judge uses ("" when there is none)."""
+    if API_KEY:
+        body = {"model": MODEL, "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]}
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages", data=json.dumps(body).encode(),
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return "".join(b.get("text", "") for b in json.loads(r.read()).get("content", [])).strip()
+    if CLAUDE_BIN:
+        env = dict(os.environ, HTTP_PROXY=CLAUDE_PROXY, HTTPS_PROXY=CLAUDE_PROXY)
+        r = subprocess.run([CLAUDE_BIN, "-p", "--setting-sources", "", "--model", MODEL, "--output-format", "text", prompt],
+                           capture_output=True, text=True, timeout=60, env=env, cwd=str(HERE))
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout)[-200:])
+        return r.stdout.strip()
+    return ""
+
+
+def spirit_reply(heard: str, device_id: str) -> str:
+    """The spirit's answer: knows the current station, gives hints, never the answer."""
+    stations, _ = load_stations()
+    spirit = json.loads(STATIONS_FILE.read_text(encoding="utf-8")).get("spirit") or SPIRIT  # a route may set its own voice
+    with lock:
+        idx, solved = state["station"], state["station"] in state["solved"]
+        history = list(talks.get(device_id, []))
+    st = stations[idx]
+    where = (f"玩家已经解开了第{idx + 1}站。" if solved else
+             f"玩家在第{idx + 1}站，谜面是：{st.get('riddle', '')} 要找的是：{st.get('target', '')}。可以给提示，别直接说出答案。")
+    past = "".join(f"玩家：{h}\n地灵：{r}\n" for h, r in history)
+    reply = ask_text(f"{spirit}\n{where}\n{past}玩家：{heard}\n地灵：")
+    reply = " ".join(reply.split()).removeprefix("地灵：").strip("「」\"' ")[:80] or "嗯，我在听。"
+    with lock:
+        talks[device_id] = (history + [(heard, reply)])[-3:]
+    return reply
+
+
+def watcher_talk(pcm: bytes, device_id: str) -> bytes:
+    """Push-to-talk on the stock firmware (app/app_voice_interaction.c): the request body is raw 16 kHz
+    mono 16-bit PCM; the reply is JSON, then ---sensecraftboundary---, a newline, and a WAV to play."""
+    t0 = time.time()
+    heard, voiced = "", voiced_seconds(pcm)
+    try:
+        if voiced < MIN_VOICED_S:
+            reply = "我没听清，按住滚轮再说一遍？"
+        elif not ASR_URL:
+            reply = "我还听不懂说话，等我学会了再聊。"
+        else:
+            heard = transcribe(pcm)
+            reply = spirit_reply(heard, device_id) if heard else "我没听清，再说一遍？"
+    except Exception as e:
+        log(f"语音对话出错 {type(e).__name__}: {e}")
+        reply = "我刚才走神了，再说一遍好吗？"
+    wav = tts_wav(reply)
+    log(f"地灵对话 人声{voiced:.1f}s 听到={heard[:30]!r} 回={reply[:30]!r} · {time.time() - t0:.1f}s")
+    head = {"code": 200, "data": {"mode": 0, "duration": max(0, len(wav) - 44) * 1000 // 32000,
+                                  "stt_result": heard, "screen_text": reply}}
+    return json.dumps(head, ensure_ascii=False).encode() + b"---sensecraftboundary---\n" + wav
+
+
 def watcher_vision(req: dict, device_id: str) -> dict:
     """SenseCAP Watcher stock firmware image analysis (tf_module_img_analyzer.c):
     request {img: base64 jpeg, prompt, audio_txt, type}; reply {code: 200, data: {state, type, audio}}.
@@ -394,7 +504,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -434,21 +544,41 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         return "watcher-" + (hashlib.sha1(auth.encode()).hexdigest()[:6] if auth else self.ip())
 
+    def from_tunnel_blocked(self) -> bool:
+        """A request relayed by Cloudflare from the internet may only reach PUBLIC_PATHS."""
+        if self.headers.get("Cf-Connecting-Ip") and self.path.partition("?")[0] not in PUBLIC_PATHS:
+            self.send(404, {"error": "not found"})
+            return True
+        return False
+
     def watcher_auth_ok(self) -> bool:
         if WATCHER_TOKEN and self.headers.get("Authorization", "") != WATCHER_TOKEN:
             log("Watcher 请求 Token 不对，拒绝")
             return False
         return True
 
+    def cors_headers(self):
+        """Browser-hosted runtimes (AIUI preview/Studio) may send credentials, so echo the origin, not *."""
+        origin = self.headers.get("Origin")
+        self.send_header("Access-Control-Allow-Origin", origin or "*")
+        if origin:
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
+
     def do_OPTIONS(self):
+        asked = self.headers.get("Access-Control-Request-Headers", "")
+        log(f"跨域预检 {self.path.partition('?')[0]} 来自 {self.headers.get('Origin')} 头={asked!r}")
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Device")
+        self.send_header("Access-Control-Allow-Headers", asked or "Content-Type, X-Device")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
+        if self.from_tunnel_blocked():
+            return
         path = self.path.partition("?")[0]
         if path == "/":
             return self.send(200, PAGE, "text/html; charset=utf-8")
@@ -472,6 +602,36 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path, _, query = self.path.partition("?")
         body = self.read_body()
+        if self.from_tunnel_blocked():
+            return
+
+        if path == "/api/v1/talk":                  # any client: text in, the spirit's reply out
+            try:
+                text = str(json.loads(body or b"{}").get("text", "")).strip()
+            except Exception:
+                return self.send(400, {"error": "bad json"})
+            dev, kind = self.device_id("glasses")
+            seen(dev, kind, "说话", self.ip())
+            try:
+                reply = spirit_reply(text, dev) if text else "我没听清，再说一遍？"
+            except Exception as e:
+                log(f"地灵回话失败 {type(e).__name__}: {e}")
+                reply = "我刚才走神了，再说一遍好吗？"
+            log(f"地灵对话（{dev}）听到={text[:30]!r} 回={reply[:30]!r}")
+            return self.send(200, {"heard": text, "reply": reply, **compact_state()})
+
+        if path == "/api/v1/next":                  # any client: move on, but only from a solved station
+            stations, _ = load_stations()
+            with lock:
+                if state["station"] in state["solved"] and state["station"] < len(stations) - 1:
+                    state["station"] += 1
+                    state["verdict"] = None
+                    moved = True
+                else:
+                    moved = False
+            if moved:
+                log(f"下一站（{self.device_id('glasses')[0]}）")
+            return self.send(200, {"moved": moved, **compact_state()})
 
         if path == "/upload":                       # XIAO: raw JPEG, async judge
             if not body.startswith(b"\xff\xd8"):
@@ -530,16 +690,19 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"Watcher 推送解析失败 {type(e).__name__}: {e}")
             return self.send(200, {"code": 200})
 
-        if path.startswith("/v2/watcher/talk/"):     # Watcher voice: keep the raw request for inspection
+        if path == "/v2/watcher/talk/audio_stream":  # Watcher push-to-talk: answer out loud
             dev = self.watcher_id()
             seen(dev, "watcher", "语音", self.ip())
-            stem = new_name("")
-            (CAPTURES / f"voice-{stem}.bin").write_bytes(body)
-            meta = {"path": self.path, "headers": {k: v for k, v in self.headers.items() if k.lower() != "authorization"},
-                    "bytes": len(body)}
-            (CAPTURES / f"voice-{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
-            log(f"Watcher 语音 {path} {len(body) // 1024}KB 已存 voice-{stem}.bin（还没接语音对话）")
-            return self.send(200, {"code": 501, "msg": "voice not supported by this relay yet"})
+            (CAPTURES / f"voice-{new_name('')}.bin").write_bytes(body)   # kept for tuning
+            try:
+                return self.send(200, watcher_talk(body, dev), "application/octet-stream")
+            except Exception as e:
+                log(f"语音回复失败 {type(e).__name__}: {e}")
+                return self.send(200, {"code": 500, "data": {}})
+
+        if path.startswith("/v2/watcher/talk/"):     # e.g. view_task_detail: not handled
+            log(f"Watcher 语音 {path} {len(body)}B（不支持）")
+            return self.send(200, {"code": 501, "msg": "not supported by this relay"})
 
         if path == "/judge":                        # manual verdict (fallback, and for demos)
             ok = "ok=1" in query

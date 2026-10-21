@@ -220,6 +220,11 @@ void handleListen() {
 
 void connectWifi() {
   WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks();  // 先打印一遍目标网络的信号和加密方式，连不上时有据可查
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID_1 || WiFi.SSID(i) == WIFI_SSID_2)
+      Serial.printf("seen %s ch%d rssi %d auth %d\n", WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i), (int)WiFi.encryptionType(i));
+  }
   if (strlen(WIFI_SSID_1)) wifiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
   if (strlen(WIFI_SSID_2)) wifiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
   Serial.print("Wi-Fi");

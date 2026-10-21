@@ -1,0 +1,14 @@
+{
+  "agentName": "地灵",
+  "agentDesc": "当用户想玩 Loci 城市解谜，或说「打开地灵」「打开 Loci」「我要解谜」时调起。打开后显示当前这一站的谜面；点镜腿拍照让地灵判断有没有找对；上滑跟地灵说话要提示；下滑进入下一站。",
+  "pages": [
+    "pages/index/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "Loci 地灵"
+  },
+  "permissions": [
+    "CAMERA",
+    "RECORD_AUDIO"
+  ]
+}

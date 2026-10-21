@@ -45,3 +45,5 @@ node_modules/
 
 # 空目录占位
 .keep
+src/glasses/config.js
+src/glasses/.aix/

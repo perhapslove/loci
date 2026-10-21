@@ -1,0 +1,7 @@
+{
+  "name": "loci-glasses",
+  "version": "0.1.0",
+  "description": "Loci on Rokid Glasses: see the current riddle, tap the temple to show the spirit what you found",
+  "main": "app.js",
+  "dependencies": {}
+}

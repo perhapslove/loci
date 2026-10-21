@@ -2,6 +2,8 @@
 
 The relay (`src/relay/relay.py`) is the only server. Every device talks to it over plain HTTP on the local network (default port `8787`). Responses are JSON unless noted.
 
+Rokid Glasses can't reach the local network (AIUI has no LAN access and requires HTTPS), so for them the relay is published through a tunnel, e.g. `cloudflared tunnel --url http://localhost:8787`. Requests that arrive through Cloudflare (they carry `Cf-Connecting-Ip`) may only use the four `/api/v1/*` endpoints below; the web page, photos and operator controls answer 404.
+
 A device identifies itself with an `X-Device` header (or `?device=` in the query). Names starting with `watcher`, `xiao`, `glasses` / `rokid` are shown in the matching slot on the web page.
 
 ## For any client (phone, glasses, scripts)
@@ -29,6 +31,15 @@ Current progress, compact. Polling with `?device=<name>` also registers the clie
 
 Send a photo, get the verdict back in the same response (takes as long as judging does — seconds).
 Body: a raw JPEG, or JSON `{"img": "<base64 JPEG>"}`. Reply: `{"verdict": {...}, ...same fields as /api/v1/state}`.
+Once a station is solved, further photos are not judged again (`verdict.source` is `skip`) until someone moves on.
+
+### `POST /api/v1/talk`
+
+Body: `{"text": "地灵，我该去哪？"}`. Reply: `{"heard": "...", "reply": "...", ...same fields as /api/v1/state}`. The spirit knows the current station, gives hints but not the answer, and remembers the last three exchanges per device.
+
+### `POST /api/v1/next`
+
+Go to the next station, only if the current one is solved. Reply: `{"moved": true|false, ...same fields as /api/v1/state}`.
 
 ## SenseCAP Watcher (stock firmware)
 
@@ -38,7 +49,8 @@ Set the app's **Device AI Service** URL to `http://<relay address>:8787`. The fi
 |---|---|
 | `POST /v1/watcher/vision` | `{img, prompt, audio_txt, type}` → judges the image. Replies `{"code": 200, "data": {"state": 1, "type": …, "audio": "<base64 WAV>"}}` on a correct find (the Watcher speaks the story), `state: 0` otherwise. |
 | `POST /v1/notification/event` | Task alarm push. If `events.img` is present, it becomes the current photo and is judged. |
-| `POST /v2/watcher/talk/audio_stream`, `/v2/watcher/talk/view_task_detail` | Voice. **Not implemented yet:** the raw request is saved as `captures/voice-*.bin` + `.json` and the relay answers `{"code": 501}`. |
+| `POST /v2/watcher/talk/audio_stream` | Push-to-talk (hold the wheel). Body: raw 16 kHz mono 16-bit PCM, chunked. If it holds at least 0.3 s of voice, the relay transcribes it (`ASR_URL`, any OpenAI-compatible `/v1/audio/transcriptions`), lets the spirit answer, and replies JSON `{"code": 200, "data": {"mode": 0, "duration": ms, "stt_result": …, "screen_text": …}}`, then `---sensecraftboundary---`, a newline and a WAV the Watcher plays. Less voice than that gets "say it again" — ASR models invent whole sentences from near-silence. |
+| `POST /v2/watcher/talk/view_task_detail` | Not handled (`{"code": 501}`). |
 
 If `WATCHER_TOKEN` is set, `/v1/watcher/vision` requires the same value in the `Authorization` header.
 
