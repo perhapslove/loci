@@ -1,0 +1,31 @@
+# Push to main → publish src/web to Cloudflare Pages (project "loci").
+# Secrets CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID live in the repo settings.
+# Runs only on push to main (and manual), never on pull requests, so forks never see the secrets.
+name: Deploy web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/web/**"
+      - ".github/workflows/deploy-web.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy src/web --project-name=loci --branch=main --commit-hash=${{ github.sha }}
