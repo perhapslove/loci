@@ -138,6 +138,10 @@ class Journal:
         """Every day that has a run, oldest first."""
         return sorted({p.name[:8] for p in self.runs.glob("*-*") if p.name[:8].isdigit()})
 
+    def changed_at(self, day: str) -> float:
+        """When that day's journal was last written (0 if never)."""
+        return max((p.stat().st_mtime for p in self.runs.glob(f"{day}-*/moments.jsonl")), default=0.0)
+
     def pending(self, day: str) -> int:
         """How many photos of that day the nightly tidy-up would still delete (orphans included)."""
         with self.lock:

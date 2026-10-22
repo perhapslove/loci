@@ -1067,13 +1067,14 @@ def serve(host=HOST, port=PORT):
 
 
 def nightly(day: str | None = None) -> dict:
-    """Write the day's digest next to the photos, then delete the photos nobody kept."""
+    """Delete the photos nobody kept, then write the day's digest next to the photos (after the prune, so
+    the digest is newer than the journal it summarises and reflects what is left)."""
     day = day or time.strftime("%Y%m%d")
+    deleted = journal.prune(day)
     digest = journal.digest(day)
     out = CAPTURES / "digests"
     out.mkdir(exist_ok=True)
     (out / f"{day}.json").write_text(json.dumps(digest, ensure_ascii=False, indent=1), encoding="utf-8")
-    deleted = journal.prune(day)
     log(f"每晚整理 {day}：拾遗 {len(digest['kept'])} 个，删掉照片 {deleted} 张")
     return {**digest, "deleted": deleted}
 
@@ -1088,7 +1089,9 @@ def nightly_tick(done: set) -> None:
         jobs.append(today)
     for day in jobs:
         try:
-            if day == today or journal.pending(day) or not (CAPTURES / "digests" / f"{day}.json").exists():
+            digest = CAPTURES / "digests" / f"{day}.json"
+            stale = not digest.exists() or journal.changed_at(day) > digest.stat().st_mtime   # talk/keeps after it
+            if day == today or journal.pending(day) or stale:
                 nightly(day)
             if day == today:
                 done.add(f"{day}+early")

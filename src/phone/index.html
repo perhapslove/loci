@@ -324,17 +324,18 @@ $('camera').onchange = async () => {
 };
 
 // Hold to talk.
-let recorder = null, chunks = [], holding = false;
+let recorder = null, chunks = [], holding = false, press = 0;
 async function startTalk(ev) {
   ev.preventDefault();
   if (recorder || holding) return;
   holding = true;
+  const mine = ++press;      // each press gets a number: a microphone that opens for an older press is closed
   let stream = null;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    if (!holding) {   // let go while the phone was still asking for the microphone
+    if (mine !== press || !holding || recorder) {   // let go (or pressed again) while the phone was still asking
       stream.getTracks().forEach((t) => t.stop());
-      status('麦克风可以用了，再按住说一次');
+      if (mine === press) status('麦克风可以用了，再按住说一次');
       return;
     }
     const type = ['audio/mp4', 'audio/webm'].find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';

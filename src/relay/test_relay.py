@@ -591,6 +591,29 @@ class RelayTest(unittest.TestCase):
         self.assertNotIn("phone-t2", relay.talks)                           # no old-city memory in the new route
         self.assertEqual(relay.journal.day()[-1]["route"], "stations")      # filed under what it was about
 
+    def test_a_digest_is_rebuilt_when_its_day_changed_after_it(self):
+        real_at = relay.PRUNE_AT
+        relay.PRUNE_AT = "99:99"
+        try:
+            day = time.strftime("%Y%m%d", time.localtime(time.time() - 86400))   # yesterday: still watched
+            self.past_day(day, "late-1.jpg")
+            done = set()
+            relay.nightly_tick(done)                                      # first pass writes the digest
+            digest = os.path.join(DATA, "digests", f"{day}.json")
+            first = os.path.getmtime(digest)
+            relay.nightly_tick(done)                                      # nothing changed: left alone
+            self.assertEqual(os.path.getmtime(digest), first)
+            run = os.path.join(DATA, "runs", f"{day}-t-old", "moments.jsonl")
+            with open(run, "a") as f:                                     # a talk after the first pass
+                f.write(json.dumps({"id": "2", "t": 2.0, "route": "t-old", "kind": "talk", "device": "phone-o",
+                                    "kept": False, "heard": "晚安", "said": "明天见"}) + "\n")
+            os.utime(run, (first + 5, first + 5))
+            relay.nightly_tick(done)
+            with open(digest) as f:
+                self.assertEqual(json.load(f)["counts"]["talk"], 1)
+        finally:
+            relay.PRUNE_AT = real_at
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))
