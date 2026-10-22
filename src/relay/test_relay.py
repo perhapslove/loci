@@ -529,6 +529,29 @@ class RelayTest(unittest.TestCase):
         again = [m for m in relay.journal.day() if m["id"] == first["id"]][0]
         self.assertNotEqual(again.get("by"), "manual")                    # station 1's record left alone
 
+    def test_a_negative_length_is_refused(self):
+        head = b"POST /api/v1/log HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: -1\r\n\r\n" + b"x" * 64
+        self.assertTrue(self.raw(head).startswith(b"HTTP/1.1 400"))
+
+    def test_a_route_switch_while_a_photo_is_on_its_way_solves_nothing(self):
+        relay.ask_model = lambda jpeg, station, path: {"match": True, "text": "找到了", "people": False, "source": "test"}
+        relay.tts_wav = lambda text: FAKE_WAV
+        real, switched = relay.load_route, []
+        def load_then_someone_switches(path=None):
+            route = real(path)
+            if not switched:
+                switched.append(1)
+                with relay.lock:
+                    relay.state.update(route=os.path.join(ROUTES, "t-wander.json"), station=0, solved=[],
+                                       epoch=relay.state["epoch"] + 1)
+            return route
+        relay.load_route = load_then_someone_switches
+        try:
+            self.req("POST", "/api/v1/photo?device=phone-r2", JPEG, {"Content-Type": "image/jpeg"})
+        finally:
+            relay.load_route = real
+        self.assertEqual(relay.state["solved"], [])                     # the old question can't solve the new route
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))

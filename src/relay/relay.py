@@ -280,11 +280,15 @@ def new_name(suffix: str) -> str:
     return time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}-{next(_seq) % 10000:04d}{suffix}"
 
 
-def judge(fname: str, jpeg: bytes, stations: list) -> tuple[int, dict]:
-    """Judge a photo against the current station. Returns that station's index and the verdict."""
+def snapshot() -> tuple[Path, int, int, bool]:
+    """Route file, station, play-through and whether that station is solved — read together, so a photo is
+    judged against one consistent moment even if someone switches route while it is on its way."""
     with lock:
-        idx, epoch = state["station"], state["epoch"]
-        already_solved = idx in state["solved"]
+        return Path(state["route"]), state["station"], state["epoch"], state["station"] in state["solved"]
+
+
+def judge(fname: str, jpeg: bytes, stations: list, idx: int, epoch: int, already_solved: bool) -> dict:
+    """Judge a photo against station `idx` of the play-through `epoch` (both from snapshot())."""
     if already_solved:  # don't re-judge (or retell the story) until someone moves on
         verdict = {"match": None, "text": "这一站已经解开了，点「下一站」继续。", "source": "skip"}
     else:
@@ -298,7 +302,7 @@ def judge(fname: str, jpeg: bytes, stations: list) -> tuple[int, dict]:
         elif state["photo"] == fname and (state["verdict"] or {}).get("source") == "manual":
             verdict = {**verdict, "match": state["verdict"]["match"], "source": "manual"}   # the person wins
     log(f"站{idx + 1} 判定 {verdict.get('match')} · {verdict.get('text')} · {verdict.get('source')}")
-    return idx, verdict
+    return verdict
 
 
 def see(jpeg: bytes, device_id: str, lat=None, lon=None, taken=None, taken_route=None, taken_station=None) -> dict:
@@ -309,14 +313,14 @@ def see(jpeg: bytes, device_id: str, lat=None, lon=None, taken=None, taken_route
     A photo sent late (`taken`: the phone kept it while the relay was unreachable) says which route and
     station it was taken on. If the player has moved on since, it is only described, in that route's
     city, and filed under that route: it never solves a station it wasn't taken for."""
-    route = load_route()
+    path, idx, epoch, already_solved = snapshot()
+    route = load_route(path)
     where = {"lat": lat, "lon": lon} if lat is not None else {}
     elsewhere = False
     if taken:
         where["taken_at"] = round(taken, 3)
         if taken_route:
-            with lock:
-                here = state["station"] + 1
+            here = idx + 1
             elsewhere = taken_route != route["code"] or (route["mode"] == "quest" and taken_station not in (None, here))
             if elsewhere:
                 then = next((f for f in route_files() if f.stem == taken_route), None)
@@ -337,7 +341,7 @@ def see(jpeg: bytes, device_id: str, lat=None, lon=None, taken=None, taken_route
         m = journal.add(route["code"], "look", device_id, photo=fname, said=say, people=people_in(v), **where)
         log(f"漫游看图 · {say[:30]} · 有人={people_in(v)} · {v.get('source')}")
         return {"verdict": v, "say": say, "moment": m["id"]}
-    idx, v = judge(fname, jpeg, route["stations"])
+    v = judge(fname, jpeg, route["stations"], idx, epoch, already_solved)
     say = unlocked_text(route["stations"][idx], v) if v.get("match") is True else (v.get("text") or "")
     m = journal.add(route["code"], "judge", device_id, photo=fname, match=v.get("match"), said=say,
                     people=people_in(v), station=idx + 1, **where)
@@ -705,6 +709,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.rfile.readline(1024)      # CRLF after each chunk
             return b"".join(chunks)
         n = int(self.headers.get("Content-Length", "0") or 0)
+        if n < 0:
+            raise ValueError("negative length")
         if n > MAX_BODY:
             raise ValueError("body too large")
         return self.rfile.read(n) if n else b""
