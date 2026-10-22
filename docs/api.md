@@ -21,7 +21,7 @@ A route is one JSON file. The relay plays one route at a time (`STATIONS`, defau
 
 Every look, judgement and exchange is a *moment*, appended to `LOCI_DATA/runs/<YYYYMMDD>-<route>/moments.jsonl` with time, device, place (`lat`/`lon` when the client sends them) and what the spirit said. With every look or judgement the model also says whether there are recognisable people in the photo (`people`).
 
-At `PRUNE_AT` (default `23:30`) the relay writes that day's digest to `LOCI_DATA/digests/<YYYYMMDD>.json`, then deletes every photo that isn't worth keeping. A photo survives only if it was kept or solved **and** the model said there are no people in it; a photo with people — or one the model said nothing about — is deleted even if kept, because strangers' faces are only for judging on the spot. The moment and what the spirit said stay. Days the relay missed (the Mac was asleep, photos after `PRUNE_AT`, a pass that failed) are caught up within a minute of the relay running again.
+At `PRUNE_AT` (default `23:30`) the relay writes that day's digest to `LOCI_DATA/digests/<YYYYMMDD>.json`, then deletes every photo that isn't worth keeping. A photo survives only if it was kept or solved **and** the model said there are no people in it; a photo with people — or one the model said nothing about — is deleted even if kept, because strangers' faces are only for judging on the spot. The moment and what the spirit said stay. Days the relay missed (the Mac was asleep, photos after `PRUNE_AT`, a pass that failed) are caught up within a minute of the relay running again. A day that only has photos (the relay stopped before recording any) is tidied too, as long as it is not older than the first day of the journal; earlier photos are left alone.
 
 ## For any client (phone, glasses, scripts)
 
@@ -50,7 +50,7 @@ Current progress, compact. Polling with `?device=<name>` also registers the clie
 ### `POST /api/v1/photo`
 
 Send a photo, get the answer back in the same response (takes as long as the model does — seconds).
-Body: a raw JPEG, or JSON `{"img": "<base64 JPEG>", "lat": …, "lon": …}`; `?lat=&lon=` in the query works too. A photo sent late (the phone kept it while the relay was unreachable) adds `?at=<ms since 1970>` (recorded as `taken_at`) and the `route` and `station` it was taken on. If the player has moved on since, it is only described, in that route's city, and never solves a station. The same device sending the same `at` again (the first answer got lost) gets the first answer back, not a second judgement. Bodies over 25 MB get 413.
+Body: a raw JPEG, or JSON `{"img": "<base64 JPEG>", "lat": …, "lon": …}`; `?lat=&lon=` in the query works too. A photo sent late (the phone kept it while the relay was unreachable) adds `?at=<ms since 1970>` (recorded as `taken_at`) and the `route` and `station` it was taken on. If the player has moved on since, it is only described, in that route's city, and never solves a station. The phone sends `at` with every photo, not only late ones, so the same device sending the same `at` again (the first answer got lost) gets the first answer back, not a second judgement. Bodies over 25 MB get 413.
 Reply: `{"verdict": {...}, "say": "…", "voice": "/api/v1/voice/<id>.wav", "moment": "<id>", ...same fields as /api/v1/state}`. In a quest `say` is the story or a nudge; in wander it is what the spirit noticed.
 Once a station is solved, further photos are not judged again (`verdict.source` is `skip`) until someone moves on.
 

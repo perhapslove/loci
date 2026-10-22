@@ -758,6 +758,23 @@ class RelayTest(unittest.TestCase):
         with open(os.path.join(DATA, "digests", f"{day}.json")) as f:
             self.assertEqual(json.load(f)["counts"]["talk"], 1)
 
+    def test_a_day_with_only_an_unrecorded_photo_is_still_tidied(self):
+        real_at = relay.PRUNE_AT
+        relay.PRUNE_AT = "99:99"
+        try:
+            self.past_day("20200110", "first.jpg")                        # the journal exists from here on
+            lone = os.path.join(DATA, "20200111-090000-000-0001.jpg")      # stopped before recording it
+            older = os.path.join(DATA, "20200109-090000-000-0001.jpg")     # before the journal: history
+            for f in (lone, older):
+                with open(f, "wb") as fh:
+                    fh.write(JPEG)
+                os.utime(f, (time.time() - 3600, time.time() - 3600))
+            relay.nightly_tick(set())
+            self.assertFalse(os.path.exists(lone))
+            self.assertTrue(os.path.exists(older))
+        finally:
+            relay.PRUNE_AT = real_at
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))

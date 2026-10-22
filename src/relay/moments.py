@@ -140,8 +140,14 @@ class Journal:
         return m.get("people") is False and (m["kept"] or (m["kind"] == "judge" and m.get("match") is True))
 
     def days(self) -> list[str]:
-        """Every day that has a run, oldest first."""
-        return sorted({p.name[:8] for p in self.runs.glob("*-*") if p.name[:8].isdigit()})
+        """Every day that has a run, plus every day since the first run that only has photos (the relay
+        stopped before recording that day's first moment), oldest first. Photos from before the journal
+        existed are history the tidy-up never touches."""
+        runs = {p.name[:8] for p in self.runs.glob("*-*") if p.name[:8].isdigit()}
+        if not runs:
+            return []
+        photos = {f.name[:8] for f in self.photos.glob("*.jpg") if f.name[:8].isdigit()}
+        return sorted(runs | {d for d in photos if d >= min(runs)})
 
     def changed_at(self, day: str) -> float:
         """When that day's journal was last written (0 if never)."""

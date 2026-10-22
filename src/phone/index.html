@@ -306,7 +306,9 @@ $('camera').onchange = async () => {
   try {
     [photo] = await Promise.all([shrink(file), locate()]);
     $('shot').src = URL.createObjectURL(photo); $('shot').style.display = 'block';
-    const s = await call('/api/v1/photo', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: photo });
+    // `at` on the first try too: if this reaches the relay but the answer is lost, the queued retry
+    // carries the same `at` and gets the first answer back instead of a second judgement
+    const s = await call('/api/v1/photo', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: photo }, { at: String(at) });
     show(s); speak(s);
     status(s.mode === 'quest' ? (s.verdict && s.verdict.match ? '找到了！' : '还没找到') : '说「收起来」或点「收起来」，留进今天的拾遗');
   } catch (e) {
