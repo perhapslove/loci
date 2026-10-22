@@ -775,6 +775,28 @@ class RelayTest(unittest.TestCase):
         finally:
             relay.PRUNE_AT = real_at
 
+    def test_two_copies_of_a_photo_at_once_are_judged_once(self):
+        calls = []
+        def slow_look(jpeg, station, path):
+            calls.append(1)
+            time.sleep(0.4)                                               # the model takes its time
+            return {"text": "钟楼", "people": False, "source": "test"}
+        relay.ask_model = slow_look
+        relay.tts_wav = lambda text: FAKE_WAV
+        self.wander()
+        q = "/api/v1/photo?device=phone-c2&at=1792600009000"
+        answers = []
+        def send():
+            answers.append(self.req("POST", q, JPEG, {"Content-Type": "image/jpeg"})[1]["moment"])
+        first = threading.Thread(target=send)
+        first.start()
+        time.sleep(0.1)
+        send()                                                            # the retry, while the first is judged
+        first.join()
+        self.assertEqual((len(calls), len(set(answers))), (1, 1))
+        self.assertEqual(sum(m["device"] == "phone-c2" for m in relay.journal.day()), 1)
+        self.assertEqual(relay.inflight, {})
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))

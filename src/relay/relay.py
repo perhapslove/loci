@@ -134,6 +134,8 @@ state = {
     "log": [],
 }
 talks = {}                  # device id → last few (heard, reply) pairs, so the spirit remembers the chat
+inflight = {}               # (device, taken_at) → {"done": Event, "out": answer}: photos being judged right now
+inflight_lock = threading.Lock()
 
 
 def load_route(path: Path | None = None) -> dict:
@@ -999,19 +1001,39 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "not a jpeg"})
             dev, kind = self.device_id("glasses")
             seen(dev, kind, "拍照", self.ip())
-            at = self.query_float(query, "at")      # ms since 1970, set by a phone sending a photo late
+            at = self.query_float(query, "at")      # ms since 1970: when the phone took it (same on a retry)
+            key, job, mine = None, None, True
             if at:
-                prev = journal.find_taken(dev, round(at / 1000, 3))
+                key = (dev, round(at / 1000, 3))
+                with inflight_lock:                 # a copy of a photo still being judged waits for that answer
+                    job = inflight.get(key)
+                    mine = job is None
+                    if mine:
+                        job = inflight[key] = {"done": threading.Event(), "out": None}
+                if not mine:
+                    job["done"].wait(150)
+                    if job["out"] is not None:
+                        log(f"同一张照片又到了（{dev}），等第一份结果")
+                        return self.send(200, {**compact_state(), **job["out"], "voice": voice_url(job["out"]["say"])})
+            try:
+                prev = journal.find_taken(*key) if key else None
                 if prev:                            # sent again because the answer got lost: same answer
                     log(f"补传重复（{dev}）{prev['id']}，回上次的结果")
                     said = prev.get("said") or ""
                     out = {"verdict": {"match": prev.get("match"), "text": said, "people": prev.get("people"),
                                        "source": "repeat"}, "say": said, "moment": prev["id"]}
-                    return self.send(200, {**compact_state(), **out, "voice": voice_url(said)})
-            r = re.search(r"(?:^|&)route=([\w.-]+)", query)
-            st = self.query_float(query, "station")
-            out = see(jpeg, dev, lat, lon, taken=at / 1000 if at else None,
-                      taken_route=r.group(1) if r else None, taken_station=int(st) if st else None)
+                else:
+                    r = re.search(r"(?:^|&)route=([\w.-]+)", query)
+                    st = self.query_float(query, "station")
+                    out = see(jpeg, dev, lat, lon, taken=at / 1000 if at else None,
+                              taken_route=r.group(1) if r else None, taken_station=int(st) if st else None)
+                if mine and job:
+                    job["out"] = out
+            finally:
+                if mine and job:
+                    job["done"].set()
+                    with inflight_lock:
+                        inflight.pop(key, None)
             return self.send(200, {**compact_state(), **out, "voice": voice_url(out["say"])})
 
         if path == "/audio":                        # XIAO: raw WAV, stored only
