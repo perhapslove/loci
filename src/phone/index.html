@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d0f0d">
+<title>Loci 地灵</title>
+<style>
+  :root { --bg: #0d0f0d; --card: #171a17; --line: #262b26; --ink: #e9efe9; --dim: #8d978d; --spirit: #40ff5e; --warn: #ffb35c; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.55 -apple-system, "PingFang SC", sans-serif;
+         padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); }
+  header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  h1 { font-size: 20px; margin: 0; flex: 1; }
+  select { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 8px; font-size: 15px; max-width: 55%; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  .label { color: var(--dim); font-size: 13px; margin-bottom: 4px; }
+  .riddle { font-size: 19px; }
+  .spirit { color: var(--spirit); font-size: 18px; min-height: 1.5em; }
+  .status { color: var(--dim); font-size: 14px; min-height: 1.4em; }
+  .status.warn { color: var(--warn); }
+  img.shot { width: 100%; border-radius: 10px; display: none; margin-top: 10px; }
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  button { font: inherit; border: 0; border-radius: 14px; padding: 18px 10px; background: #233023; color: var(--ink);
+           user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+  button.big { grid-column: span 2; background: #1f5a2a; font-size: 20px; padding: 22px 10px; }
+  button.talk.live { background: #7a2f2a; }
+  button:disabled { opacity: .45; }
+  .digest img { width: 100%; border-radius: 10px; margin-top: 8px; }
+  .digest .item { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+  .sayrow { display: flex; gap: 8px; margin-bottom: 12px; }
+  .sayrow input { flex: 1; min-width: 0; font: inherit; color: var(--ink); background: var(--card); border: 1px solid var(--line);
+                  border-radius: 14px; padding: 14px; }
+  .sayrow button { padding: 14px 18px; }
+  .later .item { display: flex; gap: 10px; align-items: center; border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+  .later .item div { flex: 1; }
+  .later .item button { padding: 10px 14px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Loci 地灵</h1>
+  <select id="routes" aria-label="路线"></select>
+</header>
+
+<div class="card">
+  <div class="label" id="progress">正在连接地灵…</div>
+  <div class="riddle" id="riddle"></div>
+</div>
+
+<div class="card">
+  <div class="label">地灵说</div>
+  <div class="spirit" id="spirit">…</div>
+  <img class="shot" id="shot" alt="刚拍的照片">
+</div>
+
+<div class="actions">
+  <button class="big" id="look">让地灵看</button>
+  <button class="talk" id="talk">按住说话</button>
+  <button id="keep">收起来</button>
+  <button id="next" class="hidden">下一站</button>
+  <button id="digestBtn">今天的拾遗</button>
+</div>
+<input type="file" id="camera" accept="image/*" capture="environment" class="hidden">
+<form class="sayrow" id="sayForm">
+  <input id="sayText" placeholder="打字，或点键盘上的话筒说" enterkeyhint="send" autocomplete="off" aria-label="跟地灵说">
+  <button type="submit">说</button>
+</form>
+
+<div class="status" id="status"></div>
+<div class="label" id="pending"></div>
+<div class="card later hidden" id="later"><div class="label">刚补传的（离线时拍的）</div></div>
+<div class="card digest hidden" id="digest"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+// The key arrives as #key=… and is remembered; the device name is per phone. The key stays in the address
+// (the part after # never reaches a server) so "Add to Home Screen" saves a link that still works, even
+// though a home-screen app on iOS has its own storage.
+const hashKey = (location.hash.match(/key=([\w-]+)/) || [])[1];
+if (hashKey) store.set('loci-key', hashKey);
+const KEY = store.get('loci-key') || '';
+let DEVICE = store.get('loci-device');
+if (!DEVICE) { DEVICE = 'phone-' + Math.random().toString(36).slice(2, 7); store.set('loci-device', DEVICE); }
+
+let where = null;         // last known position
+let solved = false;
+let playing = { route: null, station: null };   // where the player is, so a photo kept offline remembers it
+const player = new Audio();
+
+function status(msg, warn) { $('status').textContent = msg || ''; $('status').className = 'status' + (warn ? ' warn' : ''); }
+
+function url(path, extra) {
+  const q = new URLSearchParams({ device: DEVICE, ...(extra || {}) });
+  if (KEY) q.set('key', KEY);
+  if (where && !q.has('lat')) { q.set('lat', where.lat.toFixed(6)); q.set('lon', where.lon.toFixed(6)); }
+  return `${path}?${q}`;
+}
+
+// "Asleep": the relay can't be reached — no signal, or the Mac is closed (the tunnel answers 502/530).
+const ASLEEP = [502, 503, 504, 521, 522, 523, 524, 530];
+function asleep(msg) { const e = new Error(msg); e.asleep = true; return e; }
+
+async function call(path, options = {}, extra) {
+  let res;
+  try { res = await fetch(url(path, extra), options); } catch (e) { throw asleep('连不上地灵'); }
+  if (res.status === 401) throw new Error('需要密钥：请用带 #key= 的链接打开一次');
+  if (ASLEEP.includes(res.status)) throw asleep('地灵睡着了');
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// Offline: photos taken while the spirit is asleep wait on the phone (IndexedDB) and go up when it wakes.
+const outbox = {
+  db: null,
+  open() {
+    this.db = this.db || new Promise((done, fail) => {
+      const r = indexedDB.open('loci', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('outbox', { keyPath: 'at' });
+      r.onsuccess = () => done(r.result);
+      r.onerror = () => fail(r.error);
+    });
+    return this.db;
+  },
+  async run(mode, fn) {
+    const db = await this.open();
+    return new Promise((done, fail) => {
+      const tx = db.transaction('outbox', mode);
+      const req = fn(tx.objectStore('outbox'));
+      tx.oncomplete = () => done(req.result);
+      tx.onerror = () => fail(tx.error);
+    });
+  },
+  add(item) { return this.run('readwrite', (st) => st.put(item)); },
+  all() { return this.run('readonly', (st) => st.getAll()); },
+  remove(at) { return this.run('readwrite', (st) => st.delete(at)); },
+};
+
+// Photos wait on the phone for the rest of the day they were taken, no longer: nobody has checked them for
+// strangers' faces, so they are not kept past that day.
+const sameDay = (at) => new Date(at).toDateString() === new Date().toDateString();
+async function dropStale() {
+  for (const it of await outbox.all()) if (!sameDay(it.at)) await outbox.remove(it.at);
+}
+
+async function showPending() {
+  const box = $('pending');
+  box.textContent = '';
+  try {
+    await dropStale();
+    const n = (await outbox.all()).length;
+    if (!n) return;
+    box.append(`手机里还有 ${n} 张等地灵醒了再看（只留到今天）`);
+    const clear = document.createElement('button');
+    clear.textContent = '清掉';
+    clear.style.cssText = 'padding:4px 10px;margin-left:8px;font-size:13px';
+    clear.onclick = async () => {
+      for (const it of await outbox.all()) await outbox.remove(it.at);
+      showPending();
+    };
+    box.append(clear);
+  } catch (e) { /* no storage on this phone: nothing waits */ }
+}
+
+let flushing = false;
+async function flush() {
+  if (flushing) return;
+  flushing = true;
+  try {
+    await dropStale();
+    const items = (await outbox.all()).sort((a, b) => a.at - b.at);
+    for (const it of items) {
+      const extra = { at: String(it.at) };
+      if (it.lat != null) { extra.lat = it.lat.toFixed(6); extra.lon = it.lon.toFixed(6); }
+      if (it.route) extra.route = it.route;               // judged against where it was taken, not where we are now
+      if (it.station) extra.station = String(it.station);
+      const s = await call('/api/v1/photo', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' },
+        body: new Blob([it.jpeg], { type: 'image/jpeg' }) }, extra);
+      await outbox.remove(it.at);
+      addLater(it.at, s);
+    }
+  } catch (e) {
+    if (!e.asleep) report(`flush failed: ${e.message}`);
+  } finally { flushing = false; showPending(); }
+}
+
+function addLater(at, s) {
+  const row = document.createElement('div');
+  row.className = 'item';
+  const text = document.createElement('div');
+  text.textContent = `${new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · ${s.say || ''}`;
+  const btn = document.createElement('button');
+  btn.textContent = '收起来';
+  btn.onclick = async () => {
+    try {
+      const k = await call('/api/v1/keep', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ moment: s.moment }) });
+      btn.disabled = true; btn.textContent = k.kept ? '收好了' : '收不了';
+      if (k.say && k.say !== '收起来了。') status(k.say);
+    } catch (e) { status(`收不了：${e.message}`, true); }
+  };
+  row.append(text, btn);
+  $('later').append(row);
+  $('later').classList.remove('hidden');
+}
+
+function report(msg) {
+  fetch(url('/api/v1/log'), { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg: `[phone] ${msg}` }) }).catch(() => {});
+}
+
+function locate() {
+  if (!navigator.geolocation) return Promise.resolve();
+  return new Promise((done) => navigator.geolocation.getCurrentPosition(
+    (p) => { where = { lat: p.coords.latitude, lon: p.coords.longitude }; done(); },
+    () => done(), { enableHighAccuracy: true, timeout: 5000, maximumAge: 60000 }));
+}
+
+// iPhones only play sound after a tap; unlock the one shared player on the first touch.
+let unlocked = false;
+document.addEventListener('touchstart', () => {
+  if (unlocked) return;
+  unlocked = true;
+  player.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+  player.play().catch(() => {});
+}, { once: true, passive: true });
+
+function speak(s) {
+  if (s.say) $('spirit').textContent = s.say;
+  if (s.voice) {
+    player.src = s.voice + (KEY ? `?key=${KEY}` : '');
+    player.play().catch(() => {});
+  }
+}
+
+function show(s) {
+  playing = { route: s.route || null, station: s.mode === 'quest' ? s.station : null };
+  $('title').textContent = s.title || 'Loci 地灵';
+  solved = s.mode === 'quest' && (s.solved || []).includes(s.station);
+  $('progress').textContent = s.mode === 'wander'
+    ? `漫游 · ${s.city || ''}`
+    : `第 ${s.station} / ${s.total} 站${solved ? ' · 已解开' : ''}`;
+  $('riddle').textContent = s.riddle || '';
+  $('next').classList.toggle('hidden', !solved);
+  if (s.unlocked && solved) $('spirit').textContent = s.unlocked;
+}
+
+async function refresh() {
+  try {
+    show(await call('/api/v1/state'));
+    if ($('status').classList.contains('warn') && /睡着|连不上/.test($('status').textContent)) status('地灵醒了');
+    flush();
+  } catch (e) { status(e.asleep ? '地灵睡着了（Mac 合上了或没网）。照样可以拍，先存在手机里。' : `连不上地灵：${e.message}`, true); }
+}
+
+async function loadRoutes() {
+  try {
+    const r = await call('/api/v1/routes');
+    $('routes').innerHTML = r.routes.map((x) =>
+      `<option value="${esc(x.route)}" ${x.route === r.current ? 'selected' : ''}>${esc(x.city ? x.city + ' · ' : '')}${esc(x.title)}</option>`).join('');
+  } catch (e) { /* the state call already reports connection problems */ }
+}
+
+$('routes').onchange = async () => {
+  status('换路线…');
+  try {
+    const s = await call('/api/v1/route', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route: $('routes').value }) });
+    show(s); speak(s); status('');
+  } catch (e) { status(`换不了：${e.message}`, true); }
+};
+
+// Photos: shrink to 1600 px before upload — mobile data abroad is slow.
+function shrink(file) {
+  return new Promise((done, fail) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(img.src);
+      c.toBlob((b) => (b ? done(b) : fail(new Error('压缩失败'))), 'image/jpeg', 0.85);
+    };
+    img.onerror = () => fail(new Error('读不了这张照片'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+$('look').onclick = () => $('camera').click();
+$('camera').onchange = async () => {
+  const file = $('camera').files[0];
+  $('camera').value = '';
+  if (!file) return;
+  $('look').disabled = true;
+  status('地灵在看…');
+  let photo = null;
+  const at = Date.now();
+  try {
+    [photo] = await Promise.all([shrink(file), locate()]);
+    $('shot').src = URL.createObjectURL(photo); $('shot').style.display = 'block';
+    const s = await call('/api/v1/photo', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: photo });
+    show(s); speak(s);
+    status(s.mode === 'quest' ? (s.verdict && s.verdict.match ? '找到了！' : '还没找到') : '说「收起来」或点「收起来」，留进今天的拾遗');
+  } catch (e) {
+    if (e.asleep && photo) {
+      try {
+        await outbox.add({ at, jpeg: await photo.arrayBuffer(), lat: where ? where.lat : null, lon: where ? where.lon : null,
+                           route: playing.route, station: playing.station });
+        status('地灵睡着了，这张先存在手机里，它醒了会自动补看。', true);
+      } catch (e2) { status(`地灵睡着了，而且手机存不下这张：${e2.message}`, true); }
+      showPending();
+    } else {
+      status(`没看成：${e.message}`, true); report(`look failed: ${e.message}`);
+    }
+  } finally { $('look').disabled = false; }
+};
+
+// Hold to talk.
+let recorder = null, chunks = [], holding = false;
+async function startTalk(ev) {
+  ev.preventDefault();
+  if (recorder || holding) return;
+  holding = true;
+  let stream = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!holding) {   // let go while the phone was still asking for the microphone
+      stream.getTracks().forEach((t) => t.stop());
+      status('麦克风可以用了，再按住说一次');
+      return;
+    }
+    const type = ['audio/mp4', 'audio/webm'].find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+    recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    chunks = [];
+    recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    recorder.onstop = () => { stream.getTracks().forEach((t) => t.stop()); sendTalk(recorder.mimeType || type); recorder = null; };
+    recorder.start();
+    $('talk').classList.add('live'); $('talk').textContent = '松开发送';
+    locate();
+  } catch (e) {   // the microphone opened but recording didn't start: let go of it, so the next try works
+    holding = false; recorder = null;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    $('talk').classList.remove('live'); $('talk').textContent = '按住说话';
+    status(`用不了麦克风：${e.message}`, true); report(`mic failed: ${e.message}`);
+  }
+}
+function stopTalk(ev) {
+  ev.preventDefault();
+  holding = false;
+  $('talk').classList.remove('live'); $('talk').textContent = '按住说话';
+  if (recorder && recorder.state === 'recording') recorder.stop();
+}
+async function sendTalk(type) {
+  const blob = new Blob(chunks, { type: type || 'audio/mp4' });
+  if (blob.size < 2000) { status('太短了，按住多说一会儿', true); return; }
+  status('地灵在听…');
+  try {
+    const s = await call('/api/v1/talk', { method: 'POST', headers: { 'Content-Type': blob.type || 'audio/mp4' }, body: blob });
+    status(s.heard ? `你：${s.heard}` : '');
+    show(s); speak(s);
+  } catch (e) { status(e.asleep ? '地灵睡着了，等它醒了再说。' : `地灵没回应：${e.message}`, true); if (!e.asleep) report(`talk failed: ${e.message}`); }
+}
+['touchstart', 'mousedown'].forEach((t) => $('talk').addEventListener(t, startTalk));
+['touchend', 'touchcancel', 'mouseup', 'mouseleave'].forEach((t) => $('talk').addEventListener(t, stopTalk));
+
+$('sayForm').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const text = $('sayText').value.trim();
+  if (!text) return;
+  $('sayText').value = '';
+  $('sayText').blur();
+  status('地灵在听…');
+  locate();
+  try {
+    const s = await call('/api/v1/talk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    status(`你：${s.heard}`);
+    show(s); speak(s);
+  } catch (e) { $('sayText').value = text; status(e.asleep ? '地灵睡着了，等它醒了再说。' : `地灵没回应：${e.message}`, true); }
+};
+
+$('keep').onclick = async () => {
+  try { const s = await call('/api/v1/keep', { method: 'POST' }); speak(s); status(s.kept ? '已收进今天的拾遗' : ''); }
+  catch (e) { status(`收不了：${e.message}`, true); }
+};
+
+$('next').onclick = async () => {
+  try { const s = await call('/api/v1/next', { method: 'POST' }); show(s); speak({ say: s.riddle }); }
+  catch (e) { status(`走不了：${e.message}`, true); }
+};
+
+$('digestBtn').onclick = async () => {
+  const box = $('digest');
+  if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
+  try {
+    const d = await call('/api/v1/digest');
+    const items = d.kept.map((m) => `<div class="item"><div>${esc(m.said || m.heard)}</div>` +
+      (m.photo ? `<img src="/api/v1/photo-file/${encodeURIComponent(m.photo)}${KEY ? `?key=${KEY}` : ''}" loading="lazy">` : '') + '</div>').join('');
+    box.innerHTML = `<div class="label">今天：看了 ${d.counts.look + d.counts.judge} 次，说了 ${d.counts.talk} 句，收起来 ${d.kept.length} 个</div>` +
+      (items || '<div class="status">还没有收起来的。看到喜欢的，让地灵看一眼再点「收起来」。</div>');
+    box.classList.remove('hidden');
+  } catch (e) { status(`看不了拾遗：${e.message}`, true); }
+};
+
+refresh();
+loadRoutes();
+showPending();
+setInterval(refresh, 15000);
+window.addEventListener('online', refresh);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

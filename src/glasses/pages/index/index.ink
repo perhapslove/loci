@@ -11,25 +11,54 @@ import { RELAY } from '../../config.js';
 
 const DEVICE = 'glasses-rokid';
 const POLL_MS = 5000;
+const MAX_UPLOAD = 1200000;                     // bytes; bigger photos are shrunk before upload
+const SESSION = Math.random().toString(36).slice(2, 6);
 
 export default {
   data: {
     progress: '',
     riddle: '正在连接地灵…',
     story: '',
-    status: '点镜腿：拍给地灵看 · 上滑：跟地灵说话',
+    status: '点镜腿或点头：让地灵看 · 说「乐奇」：跟地灵说话',
     solved: false,
     busy: false
   },
 
   onLoad() {
+    this.station = 0;
+    this.report(`open ua=${(navigator.userAgent || '').slice(0, 60)}`);
     this.refresh();
     this.poll = setInterval(() => this.refresh(), POLL_MS);   // other devices may solve a station too
+    try {
+      this.enableWorldAwareness();                             // nod = show the spirit
+    } catch (err) {
+      this.report(`no world awareness: ${err}`);
+    }
   },
 
   onUnload() {
     clearInterval(this.poll);
     if (this.recognition) this.recognition.abort();
+  },
+
+  // One line into the relay log, so problems on the glasses are visible without a console.
+  report(msg) {
+    fetch(`${RELAY}/api/v1/log?device=${DEVICE}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msg: `[${SESSION}] ${msg}` })
+    }).catch(() => {});
+  },
+
+  onVoiceWakeup(event) {                         // "乐奇" / "Hi Rokid" / touch wakeup while Loci is open
+    if (event.preventDefault) event.preventDefault();
+    this.report(`wakeup ${event.keyword || ''}`);
+    this.listen();
+  },
+
+  onHeadGesture(event) {
+    this.report(`gesture ${event.gesture}`);
+    if (event.gesture === 'nod') this.snap();
   },
 
   async call(path, options = {}) {             // Ink's fetch rejects an undefined second argument
@@ -55,6 +84,10 @@ export default {
       story: s.unlocked || '',
       solved
     });
+    if (s.station !== this.station) {            // a new station: the spirit reads the riddle aloud
+      this.station = s.station;
+      this.say(s.riddle);
+    }
   },
 
   say(text) {
@@ -68,8 +101,8 @@ export default {
 
   async snap() {
     if (this.data.busy) return;
-    if (this.data.solved) {
-      this.setData({ status: '这一站已解开 · 下滑去下一站' });
+    if (this.data.solved) {                      // tap again after solving = go on
+      this.next();
       return;
     }
     this.setData({ busy: true, status: '地灵在看…' });
@@ -77,7 +110,7 @@ export default {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       [track] = stream.getVideoTracks();
-      const photo = await new ImageCapture(track).takePhoto({ mode: 'telephoto' });
+      const photo = await this.shrink(await this.capture(new ImageCapture(track)));
       track.stop();
       track = null;
       const s = await this.call('/api/v1/photo', {
@@ -88,16 +121,46 @@ export default {
       const v = s.verdict || {};
       this.show(s);
       if (v.match === true) {
-        this.setData({ status: '找到了！下滑去下一站' });
+        this.setData({ status: '找到了！再点一下镜腿去下一站' });
         this.say(s.unlocked);
       } else {
         this.setData({ status: v.text || '还没找到，再看看' });
       }
     } catch (err) {
       this.setData({ status: `没拍成：${(err && err.message) || err}` });
+      this.report(`snap failed: ${(err && err.message) || err}`);
     } finally {
       if (track) track.stop();
       this.setData({ busy: false });
+    }
+  },
+
+  // No system preview (it waits for a confirmation); fall back to plain defaults if the settings are refused.
+  async capture(imageCapture) {
+    try {
+      return await imageCapture.takePhoto({ mode: 'telephoto', quality: 'normal', enableSystemPreview: false });
+    } catch (err) {
+      this.report(`takePhoto telephoto refused: ${(err && err.message) || err}`);
+      return await imageCapture.takePhoto();
+    }
+  },
+
+  // Photos go to the relay through the phone; keep them around a megabyte.
+  async shrink(photo) {
+    this.report(`photo ${photo.type} ${photo.size}B`);
+    if (photo.size <= MAX_UPLOAD) return photo;
+    try {
+      const bitmap = await createImageBitmap(photo);
+      const scale = Math.min(1, 1600 / Math.max(bitmap.width, bitmap.height));
+      const canvas = new Canvas(Math.round(bitmap.width * scale), Math.round(bitmap.height * scale));
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      const small = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 });
+      this.report(`shrunk to ${small.size}B`);
+      return small;
+    } catch (err) {
+      this.report(`shrink failed, sending original: ${(err && err.message) || err}`);
+      return photo;
     }
   },
 
@@ -113,6 +176,7 @@ export default {
     };
     recognition.onerror = (event) => {
       this.setData({ busy: false, status: `没听清：${event.error || event.message || ''}` });
+      this.report(`listen error: ${event.error || event.message || ''}`);
     };
     recognition.onend = () => {
       if (this.data.status === '地灵在听…') this.setData({ busy: false, status: '没听到，上滑再说一次' });
@@ -154,13 +218,24 @@ export default {
     }
   },
 
-  onKeyUp(event) {
-    console.log('loci key', event.code);       // the Rokid key mapping is undocumented; this shows it in the log
-    const actions = { Enter: 'snap', GlobalHook: 'snap', ArrowUp: 'listen', ArrowDown: 'next' };
-    const action = actions[event.code];
-    if (!action) return;                       // Backspace keeps its default: back / close
+  // A tap arrives as Enter + GlobalHook on key-up; swipes never reached key-up in the simulator,
+  // so the arrows are also handled on key-down. Every code is reported to learn the real mapping.
+  onKeyDown(event) {
+    this.report(`keydown ${event.code}`);
+    const action = { ArrowUp: 'listen', ArrowDown: 'next' }[event.code];
+    if (!action) return;
     if (event.preventDefault) event.preventDefault();
     this[action]();
+  },
+
+  onKeyUp(event) {
+    this.report(`keyup ${event.code}`);
+    if (event.code === 'Enter' || event.code === 'GlobalHook') {
+      if (event.preventDefault) event.preventDefault();
+      this.snap();
+    } else if (event.code === 'ArrowUp' || event.code === 'ArrowDown') {
+      if (event.preventDefault) event.preventDefault();   // already handled on key-down
+    }                                                       // Backspace keeps its default: back / close
   }
 }
 </script>

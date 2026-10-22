@@ -10,11 +10,13 @@ Judging backend, first that applies:
     2. `claude` CLI installed  → `claude -p` reads the photo (~6–8 s each, uses your Claude login)
     3. otherwise, or JUDGE=manual → judge by hand with the buttons on the web page
 
-Environment: RELAY_PORT, MODEL (default claude-sonnet-5-5), STATIONS (route file), JUDGE (manual),
-CLAUDE_PROXY (default http://127.0.0.1:7890), TTS_VOICE (default Tingting), WATCHER_TOKEN,
+Environment: RELAY_PORT, RELAY_HOST (default 0.0.0.0; 127.0.0.1 = only this Mac and the tunnel), MODEL (default claude-sonnet-5-5), STATIONS (route file), JUDGE (manual),
+CLAUDE_PROXY (default http://127.0.0.1:7890; skipped when nothing listens there), TTS_VOICE (default Tingting), WATCHER_TOKEN,
 WATCHER_SPEAK_MISS=1, LOCI_DATA (where photos/audio are stored; default ./captures),
 ASR_URL / ASR_KEY / ASR_MODEL (an OpenAI-compatible /v1/audio/transcriptions endpoint, e.g. a local
-Whisper or Qwen-ASR server; without it the Watcher's push-to-talk gets a polite "I can't listen yet").
+Whisper or Qwen-ASR server; without it the Watcher's push-to-talk gets a polite "I can't listen yet"),
+ROUTES_DIR (route files players can switch to), LOCI_KEY (key required through the tunnel),
+PRUNE_AT (default 23:30: nightly digest, then photos nobody kept are deleted).
 
 Device endpoints (see docs/api.md):
     POST /upload                         XIAO ESP32S3 Sense: raw JPEG body, header X-Device
@@ -23,23 +25,32 @@ Device endpoints (see docs/api.md):
     POST /v1/notification/event          SenseCAP Watcher HTTP push (task alarm with image)
     POST /v2/watcher/talk/audio_stream   SenseCAP Watcher push-to-talk → the spirit answers out loud
     GET  /api/v1/state                   any client (glasses, phone): compact progress
-    POST /api/v1/photo                   any client: JPEG (raw or JSON {img}) → verdict in the response
-    POST /api/v1/talk                    any client: {"text": "..."} → the spirit's reply
+    POST /api/v1/photo                   any client: JPEG (raw or JSON {img}) → verdict (quest) or a look (wander)
+    POST /api/v1/talk                    any client: {"text": "..."} or a recording → the spirit's reply
+    POST /api/v1/keep                    any client: keep the last photo for the day's digest
+    GET  /api/v1/routes, POST /api/v1/route    list / switch routes
+    GET  /api/v1/digest                  the day in short: what was kept or solved
+    GET  /play                           the phone client (src/phone/index.html)
     POST /api/v1/next                    any client: go to the next station, only once this one is solved
+    POST /api/v1/log                     any client: {"msg": "..."} → one line in the relay log (for devices without a console)
 
-Requests that arrive through a Cloudflare tunnel (they carry Cf-Connecting-Ip) may only use the
-/api/v1/* endpoints above; the web page, photos and operator buttons stay on the local network.
+Requests from outside (a Cloudflare tunnel, a page on another site, a domain name pointing here) may
+only use /play and the /api/v1/* endpoints (with LOCI_KEY, if set); the operator page and buttons stay local.
 """
 
 import array
 import base64
 import hashlib
+import hmac
 import io
+import ipaddress
+import itertools
 import json
 import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -48,6 +59,9 @@ import urllib.request
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from moments import Journal
 
 HERE = Path(__file__).resolve().parent
 CAPTURES = Path(os.environ.get("LOCI_DATA", HERE / "captures"))
@@ -55,6 +69,7 @@ CAPTURES.mkdir(parents=True, exist_ok=True)
 TTS_DIR = CAPTURES / "tts"
 TTS_DIR.mkdir(exist_ok=True)
 PORT = int(os.environ.get("RELAY_PORT", "8787"))
+HOST = os.environ.get("RELAY_HOST", "0.0.0.0")   # 127.0.0.1 on a network you don't trust: only this Mac and the tunnel
 MODEL = os.environ.get("MODEL", "claude-sonnet-5-5")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 STATIONS_FILE = Path(os.environ.get("STATIONS", HERE / "stations.json"))
@@ -68,19 +83,36 @@ ASR_URL = os.environ.get("ASR_URL", "")
 ASR_KEY = os.environ.get("ASR_KEY", "")
 ASR_MODEL = os.environ.get("ASR_MODEL", "")
 MIN_VOICED_S = 0.3   # less voice than this and ASR models make up whole sentences, so ask again instead
-PUBLIC_PATHS = {"/api/v1/state", "/api/v1/photo", "/api/v1/talk", "/api/v1/next"}  # all a tunnel may reach
-SPIRIT = ("你是「地灵」，住在这座城市里的地方之灵，正被一位玩家带着在城里解谜。"
-          "用中文口语回答，像老朋友聊天，最多两句、40 个字以内。你的话会被念出来，所以不要表情符号、括号和列表。")
+ROUTES_DIR = Path(os.environ.get("ROUTES_DIR", HERE / "routes"))   # route files a player can switch between
+LOCI_KEY = os.environ.get("LOCI_KEY", "")   # when set, requests through the tunnel must carry it (?key= or X-Loci-Key)
+FFMPEG = shutil.which("ffmpeg")             # phones record AAC/Opus; turned into 16 kHz PCM for the ASR
+PHONE_PAGE = HERE.parent / "phone" / "index.html"
+MAX_BODY = 25 * 1024 * 1024                       # a phone photo is ~1 MB, a recording a few MB
+PRUNE_AT = os.environ.get("PRUNE_AT", "23:30")   # nightly: write the digest, delete photos nobody kept
+PUBLIC_PATHS = {"/api/v1/state", "/api/v1/photo", "/api/v1/talk", "/api/v1/next", "/api/v1/log",
+                "/api/v1/keep", "/api/v1/routes", "/api/v1/route", "/api/v1/digest", "/play"}  # all a tunnel may reach
+PUBLIC_PREFIXES = ("/api/v1/voice/", "/api/v1/photo-file/")
+SPIRIT = ("你是「地灵」，住在这座城市里的地方之灵，正陪一位玩家在城里走。"
+          "用中文口语回答，像老朋友聊天，最多两句、40 个字以内。你的话会被念出来，所以不要表情符号、括号和列表。"
+          "只聊这座城、这条路线和眼前的东西；不给医疗、法律、金钱方面的建议。")
+LOOK = ("你是「地灵」，住在{city}的地方之灵，正陪玩家在城里漫游。这是玩家刚让你看的照片。"
+        "挑一个最值得注意的细节，用口语说一两句（50 字以内）：它是什么、为什么有意思。"
+        "不确定就只说你看到了什么，不要编历史和名字。另外判断照片里有没有能认出脸的人。"
+        "只输出 JSON：{{\"text\": \"要念给玩家听的话\", \"people\": true 或 false}}")
+KEEP_WORDS = ("收起来", "记下来", "记住这个", "留着", "keep")
 
-# The three devices this project expects; the web page shows a slot for each.
+# The devices this project expects; the web page shows a slot for each.
 DEVICE_KINDS = {
     "watcher": "SenseCAP Watcher（地灵本体）",
     "xiao": "XIAO ESP32S3 Sense（可穿戴）",
     "glasses": "Rokid 眼镜（玩家视角）",
+    "phone": "手机（玩家视角）",
 }
 
 lock = threading.Lock()
+journal = Journal(CAPTURES)
 state = {
+    "route": str(STATIONS_FILE),
     "station": 0,
     "photo": None,          # latest photo filename
     "photo_at": None,
@@ -88,15 +120,34 @@ state = {
     "audio": None,
     "verdict": None,        # {"match": True/False/None, "text": "...", "source": "..."}
     "solved": [],
+    "epoch": 0,             # +1 on route switch / reset / a verdict by hand: a judgement still running is then stale
     "devices": {},          # id → {kind, first_seen, last_seen, last_event, ip, count}
     "log": [],
 }
 talks = {}                  # device id → last few (heard, reply) pairs, so the spirit remembers the chat
 
 
+def load_route(path: Path | None = None) -> dict:
+    """The route being played (or the one at `path`): a quest (fixed stations) or a wander (no stations,
+    the spirit just looks)."""
+    if path is None:
+        with lock:
+            path = Path(state["route"])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("stations", [])
+    data["code"] = path.stem
+    data["mode"] = data.get("mode") or ("quest" if data["stations"] else "wander")
+    return data
+
+
 def load_stations():
-    data = json.loads(STATIONS_FILE.read_text(encoding="utf-8"))
+    data = load_route()
     return data["stations"], data.get("title", "Loci")
+
+
+def route_files() -> list[Path]:
+    files = sorted(ROUTES_DIR.glob("*.json")) if ROUTES_DIR.is_dir() else []
+    return files if STATIONS_FILE in files else [STATIONS_FILE] + files
 
 
 def log(msg):
@@ -119,7 +170,7 @@ def seen(device_id: str, kind: str, event: str, ip: str = ""):
 
 def device_kind(device_id: str, default: str) -> str:
     low = device_id.lower()
-    for k in ("watcher", "glasses", "rokid", "xiao"):
+    for k in ("watcher", "glasses", "rokid", "xiao", "phone"):
         if low.startswith(k):
             return "glasses" if k == "rokid" else k
     return default
@@ -138,14 +189,16 @@ def judge_backend():
 
 
 def build_instruction(station: dict) -> str:
+    if station.get("instruction"):                   # a full prompt supplied by the caller (wander looks)
+        return station["instruction"]
     if station.get("mode") == "describe":
-        return station["prompt"] + "\n只输出 JSON：{\"match\": true, \"text\": \"要念给玩家听的话\"}"
+        return station["prompt"] + "\n另外判断照片里有没有能认出脸的人。\n只输出 JSON：{\"match\": true, \"text\": \"要念给玩家听的话\", \"people\": true 或 false}"
     return (
         "你是一个城市解谜游戏的裁判。玩家用胸前的小相机拍下他认为的答案。\n"
         f"这一站要找的东西：{station['target']}\n"
         f"判定标准：{station.get('criteria', '照片里清楚地拍到了上面这个东西')}\n"
-        "拍得模糊、只拍到一部分但能认出来，算对；拍的是别的东西，算错。\n"
-        "只输出 JSON：{\"match\": true 或 false, \"text\": \"一句话理由，对玩家说，20 字以内\"}"
+        "拍得模糊、只拍到一部分但能认出来，算对；拍的是别的东西，算错。另外判断照片里有没有能认出脸的人。\n"
+        "只输出 JSON：{\"match\": true 或 false, \"text\": \"一句话理由，对玩家说，20 字以内\", \"people\": true 或 false}"
     )
 
 
@@ -157,9 +210,22 @@ def parse_reply(raw: str) -> dict:
         return {"match": None, "text": raw.strip()[:80]}
 
 
+def claude_env() -> dict:
+    """Through CLAUDE_PROXY when it is listening (needed in mainland China), straight out when it isn't
+    (abroad, with the proxy app closed) — otherwise every judgement fails on a dead proxy."""
+    u = urlsplit(CLAUDE_PROXY) if CLAUDE_PROXY else None
+    if u and u.hostname:
+        try:
+            socket.create_connection((u.hostname, u.port or 80), timeout=0.3).close()
+            return dict(os.environ, HTTP_PROXY=CLAUDE_PROXY, HTTPS_PROXY=CLAUDE_PROXY)
+        except OSError:
+            pass
+    return {k: v for k, v in os.environ.items() if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")}
+
+
 def ask_claude_cli(path: Path, instruction: str) -> dict:
     prompt = f"用 Read 工具看这张照片：{path} 。\n{instruction}\n只输出一行 JSON，不要别的话。"
-    env = dict(os.environ, HTTP_PROXY=CLAUDE_PROXY, HTTPS_PROXY=CLAUDE_PROXY)
+    env = claude_env()
     t0 = time.time()
     r = subprocess.run([CLAUDE_BIN, "-p", "--setting-sources", "", "--model", MODEL,
                         "--allowedTools", "Read", "--output-format", "text", prompt],
@@ -206,39 +272,102 @@ def ask_model(jpeg: bytes, station: dict, path: Path) -> dict:
         return {"match": None, "text": f"模型调用失败（{type(e).__name__}），请人工判。", "source": "error"}
 
 
+_seq = itertools.count()
+
+
 def new_name(suffix: str) -> str:
-    return time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}{suffix}"
+    """Unique per file even when two photos arrive in the same millisecond."""
+    return time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}-{next(_seq) % 10000:04d}{suffix}"
 
 
-def ingest_photo(jpeg: bytes, device_id: str, sync: bool) -> dict | None:
-    """Store a photo, make it current, judge it. sync=True waits and returns the verdict."""
-    fname = new_name(".jpg")
-    (CAPTURES / fname).write_bytes(jpeg)
+def judge(fname: str, jpeg: bytes, stations: list) -> tuple[int, dict]:
+    """Judge a photo against the current station. Returns that station's index and the verdict."""
     with lock:
-        state.update(photo=fname, photo_at=time.time(), photo_from=device_id, verdict=None)
-    log(f"收到照片 {len(jpeg) // 1024}KB 来自 {device_id}")
-    if sync:
-        return judge(fname, jpeg)
-    threading.Thread(target=judge, args=(fname, jpeg), daemon=True).start()
-    return None
-
-
-def judge(fname: str, jpeg: bytes) -> dict:
-    stations, _ = load_stations()
-    with lock:
-        idx = state["station"]
+        idx, epoch = state["station"], state["epoch"]
         already_solved = idx in state["solved"]
     if already_solved:  # don't re-judge (or retell the story) until someone moves on
         verdict = {"match": None, "text": "这一站已经解开了，点「下一站」继续。", "source": "skip"}
     else:
         verdict = ask_model(jpeg, stations[idx], CAPTURES / fname)
     with lock:
-        if state["photo"] == fname:  # only if no newer photo arrived meanwhile
-            state["verdict"] = verdict
+        if state["epoch"] == epoch:      # the route was not switched or reset, nobody judged by hand
+            if state["photo"] == fname:  # and no newer photo arrived
+                state["verdict"] = verdict
             if verdict.get("match") is True and idx not in state["solved"]:
                 state["solved"].append(idx)
+        elif state["photo"] == fname and (state["verdict"] or {}).get("source") == "manual":
+            verdict = {**verdict, "match": state["verdict"]["match"], "source": "manual"}   # the person wins
     log(f"站{idx + 1} 判定 {verdict.get('match')} · {verdict.get('text')} · {verdict.get('source')}")
-    return verdict
+    return idx, verdict
+
+
+def see(jpeg: bytes, device_id: str, lat=None, lon=None, taken=None, taken_route=None, taken_station=None) -> dict:
+    """Every photo from every device comes in here: stored, judged on a quest or described on a wander,
+    and recorded as a moment, so the nightly tidy-up knows about it. Returns the verdict plus what the
+    spirit says (`say`) and the moment's id.
+
+    A photo sent late (`taken`: the phone kept it while the relay was unreachable) says which route and
+    station it was taken on. If the player has moved on since, it is only described, in that route's
+    city, and filed under that route: it never solves a station it wasn't taken for."""
+    route = load_route()
+    where = {"lat": lat, "lon": lon} if lat is not None else {}
+    elsewhere = False
+    if taken:
+        where["taken_at"] = round(taken, 3)
+        if taken_route:
+            with lock:
+                here = state["station"] + 1
+            elsewhere = taken_route != route["code"] or (route["mode"] == "quest" and taken_station not in (None, here))
+            if elsewhere:
+                then = next((f for f in route_files() if f.stem == taken_route), None)
+                route = load_route(then) if then else {**route, "code": taken_route}
+    fname = new_name(".jpg")
+    (CAPTURES / fname).write_bytes(jpeg)
+    if not elsewhere:
+        with lock:
+            state.update(photo=fname, photo_at=time.time(), photo_from=device_id, verdict=None)
+    describe = route["mode"] == "wander" or elsewhere
+    log(f"收到照片 {len(jpeg) // 1024}KB 来自 {device_id}" + ("（补传，拍在别的路线/站）" if elsewhere else "（漫游）" if describe else ""))
+    if describe:
+        v = ask_model(jpeg, {"instruction": LOOK.format(city=route.get("city") or "这座城")}, CAPTURES / fname)
+        with lock:
+            if state["photo"] == fname:
+                state["verdict"] = v
+        say = v.get("text") or "我看到了，但说不上来。"
+        m = journal.add(route["code"], "look", device_id, photo=fname, said=say, people=people_in(v), **where)
+        log(f"漫游看图 · {say[:30]} · 有人={people_in(v)} · {v.get('source')}")
+        return {"verdict": v, "say": say, "moment": m["id"]}
+    idx, v = judge(fname, jpeg, route["stations"])
+    say = unlocked_text(route["stations"][idx], v) if v.get("match") is True else (v.get("text") or "")
+    m = journal.add(route["code"], "judge", device_id, photo=fname, match=v.get("match"), said=say,
+                    people=people_in(v), station=idx + 1, **where)
+    return {"verdict": v, "say": say, "moment": m["id"]}
+
+
+def see_later(jpeg: bytes, device_id: str) -> None:
+    """For devices that don't wait for the answer (XIAO, Watcher alarm push): the web page shows it."""
+    def run():
+        try:
+            see(jpeg, device_id)
+        except Exception as e:
+            log(f"看图失败（{device_id}）{type(e).__name__}: {e}")
+    threading.Thread(target=run, daemon=True).start()
+
+
+def people_in(verdict: dict):
+    """True / False as the model said; None when it didn't say (treated like people: not kept)."""
+    p = verdict.get("people")
+    return p if isinstance(p, bool) else None
+
+
+def keep_reply(kept: dict | None) -> str:
+    if not kept:
+        return "还没有可以收的，先让我看一眼。"
+    if kept.get("people") is True:
+        return "收起来了。照片里有人，照片今晚会删掉，只留我说的话。"
+    if kept.get("people") is None:
+        return "收起来了。我没看清照片里有没有人，照片今晚会删掉，只留我说的话。"
+    return "收起来了。"
 
 
 def unlocked_text(station: dict, verdict: dict) -> str:
@@ -250,30 +379,50 @@ def unlocked_text(station: dict, verdict: dict) -> str:
 
 
 def compact_state() -> dict:
-    stations, title = load_stations()
+    route = load_route()
+    stations = route["stations"]
     with lock:
         idx, v, solved = state["station"], state["verdict"], list(state["solved"])
         devices = {k: dict(d) for k, d in state["devices"].items()}
+    base = {"title": route.get("title", "Loci"), "route": route["code"], "mode": route["mode"],
+            "city": route.get("city", ""), "verdict": v, "devices": devices}
+    if not stations:                                 # wander: no stations, nothing to solve
+        return {**base, "station": 0, "total": 0, "solved": [], "unlocked": None,
+                "riddle": route.get("intro", "随便走走。看到有意思的，就让我看看。")}
     st = stations[idx]
     solved_now = idx in solved
     return {
-        "title": title,
+        **base,
         "station": idx + 1,
         "total": len(stations),
         "solved": [i + 1 for i in solved],
         "riddle": st.get("riddle", ""),
-        "verdict": v,
         "unlocked": unlocked_text(st, v or {}) if solved_now else None,
-        "devices": devices,
     }
 
 
 # ── speech for the Watcher ───────────────────────────────────────────────
 
+def tts_key(text: str) -> str:
+    return hashlib.sha1(f"{TTS_VOICE}|{text}".encode()).hexdigest()[:16]
+
+
+def voice_url(text: str) -> str | None:
+    """Synthesize once and hand clients a URL to play (phones play it; glasses use their own voice)."""
+    if not text:
+        return None
+    try:
+        tts_wav(text)
+    except Exception as e:
+        log(f"合成语音失败 {type(e).__name__}")
+        return None
+    return f"/api/v1/voice/{tts_key(text)}.wav"
+
+
 def tts_wav(text: str) -> bytes:
     """macOS say → 16 kHz mono 16-bit WAV with a plain 44-byte header
     (the Watcher reads sample rate from a fixed header; a JUNK chunk would confuse it)."""
-    key = hashlib.sha1(f"{TTS_VOICE}|{text}".encode()).hexdigest()[:16]
+    key = tts_key(text)
     cached = TTS_DIR / f"{key}.wav"
     if cached.exists():
         return cached.read_bytes()
@@ -338,7 +487,7 @@ def ask_text(prompt: str) -> str:
         with urllib.request.urlopen(req, timeout=30) as r:
             return "".join(b.get("text", "") for b in json.loads(r.read()).get("content", [])).strip()
     if CLAUDE_BIN:
-        env = dict(os.environ, HTTP_PROXY=CLAUDE_PROXY, HTTPS_PROXY=CLAUDE_PROXY)
+        env = claude_env()
         r = subprocess.run([CLAUDE_BIN, "-p", "--setting-sources", "", "--model", MODEL, "--output-format", "text", prompt],
                            capture_output=True, text=True, timeout=60, env=env, cwd=str(HERE))
         if r.returncode != 0:
@@ -347,16 +496,40 @@ def ask_text(prompt: str) -> str:
     return ""
 
 
+def to_pcm16k(audio: bytes) -> bytes:
+    """Any recording a phone makes (AAC in MP4, Opus in WebM, WAV) → 16 kHz mono 16-bit PCM."""
+    if not FFMPEG:
+        raise RuntimeError("ffmpeg not installed")
+    r = subprocess.run([FFMPEG, "-v", "error", "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+                       input=audio, capture_output=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.decode(errors="replace")[-200:])
+    return r.stdout
+
+
+def hear(audio: bytes) -> str:
+    """A phone recording → text, with the same near-silence guard as the Watcher ("" = say it again)."""
+    pcm = to_pcm16k(audio)
+    if voiced_seconds(pcm) < MIN_VOICED_S or not ASR_URL:
+        return ""
+    return transcribe(pcm)
+
+
 def spirit_reply(heard: str, device_id: str) -> str:
-    """The spirit's answer: knows the current station, gives hints, never the answer."""
-    stations, _ = load_stations()
-    spirit = json.loads(STATIONS_FILE.read_text(encoding="utf-8")).get("spirit") or SPIRIT  # a route may set its own voice
+    """The spirit's answer: knows the route and where the player is; on a quest it hints, never answers."""
+    route = load_route()
+    stations, spirit = route["stations"], route.get("spirit") or SPIRIT   # a route may set its own voice
     with lock:
         idx, solved = state["station"], state["station"] in state["solved"]
         history = list(talks.get(device_id, []))
-    st = stations[idx]
-    where = (f"玩家已经解开了第{idx + 1}站。" if solved else
-             f"玩家在第{idx + 1}站，谜面是：{st.get('riddle', '')} 要找的是：{st.get('target', '')}。可以给提示，别直接说出答案。")
+        last = (state.get("verdict") or {}).get("text", "")
+    if not stations:
+        where = f"玩家在{route.get('city') or '城里'}随便走走。" + (f"你刚才看到并说过：{last}" if last else "")
+    elif solved:
+        where = f"玩家已经解开了第{idx + 1}站。"
+    else:
+        st = stations[idx]
+        where = f"玩家在第{idx + 1}站，谜面是：{st.get('riddle', '')} 要找的是：{st.get('target', '')}。可以给提示，别直接说出答案。"
     past = "".join(f"玩家：{h}\n地灵：{r}\n" for h, r in history)
     reply = ask_text(f"{spirit}\n{where}\n{past}玩家：{heard}\n地灵：")
     reply = " ".join(reply.split()).removeprefix("地灵：").strip("「」\"' ")[:80] or "嗯，我在听。"
@@ -394,13 +567,11 @@ def watcher_vision(req: dict, device_id: str) -> dict:
     state=1 makes the Watcher run its alarm action and play `audio` (WAV)."""
     jpeg = base64.b64decode(req.get("img", ""))
     log(f"Watcher 任务 prompt={str(req.get('prompt'))[:40]!r} audio_txt={str(req.get('audio_txt'))[:30]!r} type={req.get('type')}")
-    v = ingest_photo(jpeg, device_id, sync=True) or {}
-    stations, _ = load_stations()
-    with lock:
-        idx = state["station"]
+    out = see(jpeg, device_id)
+    v = out["verdict"]
     speech = ""
     if v.get("match") is True:
-        speech = unlocked_text(stations[idx], v)
+        speech = out["say"]
     elif WATCHER_SPEAK_MISS:
         speech = "还没找到哦，再看看。"
     data = {"state": 1 if speech else 0, "type": req.get("type", 0)}
@@ -446,7 +617,8 @@ pre{font-size:12px;color:#888;white-space:pre-wrap}
 <pre id="log"></pre>
 </main><script>
 const $=id=>document.getElementById(id);
-const KINDS={watcher:"SenseCAP Watcher（地灵本体）",xiao:"XIAO ESP32S3 Sense（可穿戴）",glasses:"Rokid 眼镜（玩家视角）"};
+const esc=t=>String(t??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const KINDS={watcher:"SenseCAP Watcher（地灵本体）",xiao:"XIAO ESP32S3 Sense（可穿戴）",glasses:"Rokid 眼镜（玩家视角）",phone:"手机（玩家视角）"};
 let last="",spoken="",cur=null;
 async function post(u){await fetch(u,{method:"POST"});tick();}
 function speak(t,lang){if(!t)return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang=lang||"zh-CN";speechSynthesis.speak(u);}
@@ -458,10 +630,10 @@ function renderDevices(devs){
     const list=byKind[kind]||[];
     if(!list.length){html+=`<div class="dev"><b>${label}</b>还没连上来</div>`;continue;}
     for(const [id,d] of list){const s=Date.now()/1000-d.last_seen;
-      html+=`<div class="dev ${s<60?"live":s<600?"idle":""}"><b>${label}</b>${id} · ${ago(d.last_seen)}<br>${d.last_event} · 共 ${d.count} 次</div>`;}
+      html+=`<div class="dev ${s<60?"live":s<600?"idle":""}"><b>${label}</b>${esc(id)} · ${ago(d.last_seen)}<br>${esc(d.last_event)} · 共 ${d.count} 次</div>`;}
   }
   for(const [kind,list] of Object.entries(byKind)){if(KINDS[kind])continue;
-    for(const [id,d] of list)html+=`<div class="dev live"><b>${id}</b>${ago(d.last_seen)} · ${d.last_event}</div>`;}
+    for(const [id,d] of list)html+=`<div class="dev live"><b>${esc(id)}</b>${ago(d.last_seen)} · ${esc(d.last_event)}</div>`;}
   $("devs").innerHTML=html;
 }
 async function tick(){
@@ -509,20 +681,32 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def read_body(self) -> bytes:
+        """The whole body, plain or chunked. Raises ValueError if it is cut off or over MAX_BODY."""
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            chunks = []
+            chunks, total, blank = [], 0, 0
             while True:
-                size_line = self.rfile.readline().strip()
+                raw = self.rfile.readline(1024)
+                if not raw:
+                    raise ValueError("connection closed mid-body")
+                size_line = raw.strip()
                 if not size_line:
+                    blank += 1
+                    if blank > 4:
+                        raise ValueError("no chunk size")
                     continue
                 size = int(size_line.split(b";")[0], 16)
                 if size == 0:
-                    self.rfile.readline()  # trailing CRLF after the last chunk
+                    self.rfile.readline(1024)  # trailing CRLF after the last chunk
                     break
+                total += size
+                if total > MAX_BODY:
+                    raise ValueError("body too large")
                 chunks.append(self.rfile.read(size))
-                self.rfile.readline()      # CRLF after each chunk
+                self.rfile.readline(1024)      # CRLF after each chunk
             return b"".join(chunks)
         n = int(self.headers.get("Content-Length", "0") or 0)
+        if n > MAX_BODY:
+            raise ValueError("body too large")
         return self.rfile.read(n) if n else b""
 
     def ip(self) -> str:
@@ -531,23 +715,55 @@ class Handler(BaseHTTPRequestHandler):
     def device_id(self, default_kind: str) -> tuple[str, str]:
         dev = self.headers.get("X-Device") or ""
         if not dev:
-            q = re.search(r"(?:^|&)device=([\w.-]+)", self.path.partition("?")[2])
+            q = re.search(r"(?:^|&)device=([^&]*)", self.path.partition("?")[2])
             dev = q.group(1) if q else ""
+        if not re.fullmatch(r"[\w.-]{1,48}", dev):    # it ends up on the operator page
+            dev = ""
         if not dev:
             dev = f"{default_kind}-{self.ip()}"
         return dev, device_kind(dev, default_kind)
 
+    @staticmethod
+    def query_float(query: str, name: str):
+        m = re.search(rf"(?:^|&){name}=(-?[\d.]+)", query)
+        return float(m.group(1)) if m else None
+
     def watcher_id(self) -> str:
-        eui = self.headers.get("API-OBITER-DEVICE-EUI")
+        eui = re.sub(r"[^\w-]", "", self.headers.get("API-OBITER-DEVICE-EUI", ""))
         if eui:
             return f"watcher-{eui[-6:]}"
         auth = self.headers.get("Authorization", "")
         return "watcher-" + (hashlib.sha1(auth.encode()).hexdigest()[:6] if auth else self.ip())
 
+    def outside(self) -> bool:
+        """From the internet (Cloudflare tunnel), from a page on another site open in a browser here, or
+        through a domain name that points at this machine (DNS rebinding). Everyone else is this Mac or a
+        device on the LAN (Host is localhost or an IP address, and any Origin is the relay itself)."""
+        if self.headers.get("Cf-Connecting-Ip"):
+            return True
+        host = self.headers.get("Host") or ""
+        name = re.match(r"(\[[^\]]*\]|[^:]*)", host).group(1).strip("[]")
+        if name and name != "localhost":
+            try:
+                ipaddress.ip_address(name)
+            except ValueError:
+                return True
+        origin = self.headers.get("Origin")
+        return bool(origin) and urlsplit(origin).netloc != host
+
     def from_tunnel_blocked(self) -> bool:
-        """A request relayed by Cloudflare from the internet may only reach PUBLIC_PATHS."""
-        if self.headers.get("Cf-Connecting-Ip") and self.path.partition("?")[0] not in PUBLIC_PATHS:
+        """A request from outside may only reach the public API, and only with the key when LOCI_KEY is
+        set (the phone page itself is the one public thing without a key)."""
+        if not self.outside():
+            return False
+        path, _, query = self.path.partition("?")
+        if path not in PUBLIC_PATHS and not path.startswith(PUBLIC_PREFIXES):
             self.send(404, {"error": "not found"})
+            return True
+        m = re.search(r"(?:^|&)key=([\w-]+)", query)
+        given = self.headers.get("X-Loci-Key") or (m.group(1) if m else "")
+        if LOCI_KEY and path != "/play" and not hmac.compare_digest(given, LOCI_KEY):
+            self.send(401, {"error": "key required"})
             return True
         return False
 
@@ -572,7 +788,6 @@ class Handler(BaseHTTPRequestHandler):
         self.cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", asked or "Content-Type, X-Device")
-        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -593,39 +808,121 @@ class Handler(BaseHTTPRequestHandler):
                 dev, kind = self.device_id("glasses")
                 seen(dev, kind, "查看进度", self.ip())
             return self.send(200, compact_state())
-        m = re.match(r"^/photo/([\w.-]+\.jpg)$", path)
-        if m and (CAPTURES / m.group(1)).exists():
-            return self.send(200, (CAPTURES / m.group(1)).read_bytes(), "image/jpeg")
+        if path == "/play":                          # the phone client
+            return self.send(200, PHONE_PAGE.read_bytes(), "text/html; charset=utf-8")
+        if path == "/api/v1/routes":
+            out = []
+            for p in route_files():
+                try:
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                out.append({"route": p.stem, "title": d.get("title", p.stem), "city": d.get("city", ""),
+                            "mode": d.get("mode") or ("quest" if d.get("stations") else "wander")})
+            return self.send(200, {"current": load_route()["code"], "routes": out})
+        if path == "/api/v1/digest":
+            day = (re.search(r"(?:^|&)day=(\d{8})", self.path.partition("?")[2]) or [None, None])[1]
+            return self.send(200, journal.digest(day))
+        m = re.match(r"^/api/v1/voice/([0-9a-f]{16})\.wav$", path)
+        if m and (TTS_DIR / f"{m.group(1)}.wav").exists():
+            return self.send(200, (TTS_DIR / f"{m.group(1)}.wav").read_bytes(), "audio/wav")
+        m = re.match(r"^/(photo|api/v1/photo-file)/([\w.-]+\.jpg)$", path)
+        if m and (CAPTURES / m.group(2)).exists():
+            # /photo/ is the operator page on this Mac; anything else gets only photos the model said
+            # have no people in them (strangers' faces are for judging on the spot, never sent out)
+            if m.group(1) == "photo" or journal.no_people(m.group(2)):
+                return self.send(200, (CAPTURES / m.group(2)).read_bytes(), "image/jpeg")
+            return self.send(404, {"error": "not found"})
         log(f"陌生 GET {self.path}")
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
         path, _, query = self.path.partition("?")
-        body = self.read_body()
-        if self.from_tunnel_blocked():
+        if self.from_tunnel_blocked():     # before reading: an outsider's body is never read
+            self.close_connection = True
             return
+        try:
+            body = self.read_body()
+        except ValueError as e:
+            log(f"请求体不对 {path}：{e}")
+            self.close_connection = True
+            return self.send(413 if "large" in str(e) else 400, {"error": str(e)})
 
-        if path == "/api/v1/talk":                  # any client: text in, the spirit's reply out
-            try:
-                text = str(json.loads(body or b"{}").get("text", "")).strip()
-            except Exception:
-                return self.send(400, {"error": "bad json"})
+        if path == "/api/v1/talk":                  # any client: text (glasses) or a recording (phone) → the spirit's reply
             dev, kind = self.device_id("glasses")
             seen(dev, kind, "说话", self.ip())
+            ctype = self.headers.get("Content-Type", "")
             try:
-                reply = spirit_reply(text, dev) if text else "我没听清，再说一遍？"
+                if ctype.startswith(("audio/", "video/", "application/octet-stream")):
+                    text = hear(body)
+                else:
+                    text = str(json.loads(body or b"{}").get("text", "")).strip()
+            except json.JSONDecodeError:
+                return self.send(400, {"error": "bad json"})
+            except Exception as e:
+                log(f"听不了录音 {type(e).__name__}: {e}")
+                text = ""
+            kept = None
+            try:
+                if text and any(w in text.lower() for w in KEEP_WORDS):
+                    kept = journal.keep(dev)
+                    reply = keep_reply(kept)
+                else:
+                    reply = spirit_reply(text, dev) if text else "我没听清，再说一遍？"
             except Exception as e:
                 log(f"地灵回话失败 {type(e).__name__}: {e}")
                 reply = "我刚才走神了，再说一遍好吗？"
+            if text:
+                journal.add(load_route()["code"], "talk", dev, heard=text, said=reply,
+                            lat=self.query_float(query, "lat"), lon=self.query_float(query, "lon"))
             log(f"地灵对话（{dev}）听到={text[:30]!r} 回={reply[:30]!r}")
-            return self.send(200, {"heard": text, "reply": reply, **compact_state()})
+            return self.send(200, {"heard": text, "reply": reply, "say": reply, "voice": voice_url(reply),
+                                   "kept": kept["id"] if kept else None, **compact_state()})
+
+        if path == "/api/v1/keep":                  # any client: keep the latest look/judgement (or a given moment)
+            dev, kind = self.device_id("glasses")
+            try:
+                mid = json.loads(body or b"{}").get("moment")
+            except Exception:
+                mid = None
+            kept = journal.keep(dev, mid)
+            say = keep_reply(kept)
+            log(f"收起来（{dev}）{kept['id'] if kept else '没有可收的'}")
+            return self.send(200, {"kept": kept["id"] if kept else None, "say": say, "voice": voice_url(say)})
+
+        if path == "/api/v1/route":                 # any client: switch route (a new city, a new quest)
+            try:
+                code = str(json.loads(body or b"{}").get("route", ""))
+            except Exception:
+                return self.send(400, {"error": "bad json"})
+            target = next((p for p in route_files() if p.stem == code), None)
+            if not target:
+                return self.send(404, {"error": "no such route"})
+            with lock:
+                state.update(route=str(target), station=0, solved=[], verdict=None, photo=None, photo_from=None,
+                             epoch=state["epoch"] + 1)
+                talks.clear()
+            log(f"换路线 → {code}")
+            st = compact_state()
+            return self.send(200, {**st, "say": st["riddle"], "voice": voice_url(st["riddle"])})
+
+        if path == "/api/v1/log":                   # any client: a short diagnostic line (devices without a console)
+            dev, kind = self.device_id("glasses")
+            seen(dev, kind, "日志", self.ip())
+            try:
+                msg = str(json.loads(body or b"{}").get("msg", ""))
+            except Exception:
+                msg = body.decode(errors="replace")
+            log(f"设备日志（{dev}）{' '.join(msg.split())[:300]}")
+            return self.send(200, {"ok": True})
 
         if path == "/api/v1/next":                  # any client: move on, but only from a solved station
             stations, _ = load_stations()
             with lock:
                 if state["station"] in state["solved"] and state["station"] < len(stations) - 1:
                     state["station"] += 1
-                    state["verdict"] = None
+                    # a new station starts without a photo: the last one was evidence for the station before
+                    state.update(verdict=None, photo=None, photo_from=None)
                     moved = True
                 else:
                     moved = False
@@ -638,22 +935,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "not a jpeg"})
             dev, kind = self.device_id("xiao")
             seen(dev, kind, "拍照", self.ip())
-            ingest_photo(body, dev, sync=False)
+            see_later(body, dev)
             return self.send(200, {"ok": True})
 
-        if path == "/api/v1/photo":                 # any client: JPEG → verdict in the response
-            jpeg = body
+        if path == "/api/v1/photo":                 # any client: JPEG → verdict (quest) or a look (wander)
+            jpeg, lat, lon = body, self.query_float(query, "lat"), self.query_float(query, "lon")
             if body[:1] == b"{":
                 try:
-                    jpeg = base64.b64decode(json.loads(body).get("img", ""))
+                    req = json.loads(body)
+                    jpeg = base64.b64decode(req.get("img", ""))
+                    lat, lon = req.get("lat", lat), req.get("lon", lon)
                 except Exception:
                     return self.send(400, {"error": "bad json"})
             if not jpeg.startswith(b"\xff\xd8"):
                 return self.send(400, {"error": "not a jpeg"})
             dev, kind = self.device_id("glasses")
             seen(dev, kind, "拍照", self.ip())
-            v = ingest_photo(jpeg, dev, sync=True)
-            return self.send(200, {"verdict": v, **compact_state()})
+            at = self.query_float(query, "at")      # ms since 1970, set by a phone sending a photo late
+            if at:
+                prev = journal.find_taken(dev, round(at / 1000, 3))
+                if prev:                            # sent again because the answer got lost: same answer
+                    log(f"补传重复（{dev}）{prev['id']}，回上次的结果")
+                    said = prev.get("said") or ""
+                    out = {"verdict": {"match": prev.get("match"), "text": said, "people": prev.get("people"),
+                                       "source": "repeat"}, "say": said, "moment": prev["id"]}
+                    return self.send(200, {**compact_state(), **out, "voice": voice_url(said)})
+            r = re.search(r"(?:^|&)route=([\w.-]+)", query)
+            st = self.query_float(query, "station")
+            out = see(jpeg, dev, lat, lon, taken=at / 1000 if at else None,
+                      taken_route=r.group(1) if r else None, taken_station=int(st) if st else None)
+            return self.send(200, {**compact_state(), **out, "voice": voice_url(out["say"])})
 
         if path == "/audio":                        # XIAO: raw WAV, stored only
             dev, kind = self.device_id("xiao")
@@ -684,7 +995,7 @@ class Handler(BaseHTTPRequestHandler):
                 events = req.get("events") or {}
                 img = events.get("img") if isinstance(events, dict) else None
                 if img:
-                    ingest_photo(base64.b64decode(img), dev, sync=False)
+                    see_later(base64.b64decode(img), dev)
                 log(f"Watcher 推送 text={str(events.get('text') if isinstance(events, dict) else '')[:40]!r} 带图={bool(img)}")
             except Exception as e:
                 log(f"Watcher 推送解析失败 {type(e).__name__}: {e}")
@@ -710,6 +1021,12 @@ class Handler(BaseHTTPRequestHandler):
                 state["verdict"] = {"match": ok, "text": "人工判定", "source": "manual"}
                 if ok and state["station"] not in state["solved"]:
                     state["solved"].append(state["station"])
+                if not ok and state["station"] in state["solved"]:   # overruling a wrong "found it"
+                    state["solved"].remove(state["station"])
+                state["epoch"] += 1                                    # and any judgement still running
+                photo = state["photo"]
+            if photo:
+                journal.judged(photo, ok)
             log(f"人工判定 {ok}")
             return self.send(200, {"ok": True})
         if path == "/station":
@@ -717,11 +1034,11 @@ class Handler(BaseHTTPRequestHandler):
             d = -1 if "d=-1" in query else 1
             with lock:
                 state["station"] = max(0, min(len(stations) - 1, state["station"] + d))
-                state["verdict"] = None
+                state.update(verdict=None, photo=None, photo_from=None)
             return self.send(200, {"ok": True})
         if path == "/reset":
             with lock:
-                state.update(station=0, verdict=None, solved=[], photo=None, photo_from=None)
+                state.update(station=0, verdict=None, solved=[], photo=None, photo_from=None, epoch=state["epoch"] + 1)
             log("重来")
             return self.send(200, {"ok": True})
 
@@ -729,12 +1046,54 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404, {"code": 404, "error": "not found"})
 
 
-def serve(host="0.0.0.0", port=PORT):
+def serve(host=HOST, port=PORT):
     return ThreadingHTTPServer((host, port), Handler)
+
+
+def nightly(day: str | None = None) -> dict:
+    """Write the day's digest next to the photos, then delete the photos nobody kept."""
+    day = day or time.strftime("%Y%m%d")
+    digest = journal.digest(day)
+    out = CAPTURES / "digests"
+    out.mkdir(exist_ok=True)
+    (out / f"{day}.json").write_text(json.dumps(digest, ensure_ascii=False, indent=1), encoding="utf-8")
+    deleted = journal.prune(day)
+    log(f"每晚整理 {day}：拾遗 {len(digest['kept'])} 个，删掉照片 {deleted} 张")
+    return {**digest, "deleted": deleted}
+
+
+def nightly_tick(done: set) -> None:
+    """Today: once, at PRUNE_AT. Any earlier day (photos after PRUNE_AT, a night the Mac slept, a run
+    that failed): again until nothing is left to delete. A day goes into `done` only once it succeeded."""
+    today = time.strftime("%Y%m%d")
+    yesterday = time.strftime("%Y%m%d", time.localtime(time.time() - 86400))
+    jobs = [d for d in journal.days() if d < today and d not in done]          # a day that is over: final pass
+    if time.strftime("%H:%M") >= PRUNE_AT and f"{today}+early" not in done:   # today at PRUNE_AT: first pass
+        jobs.append(today)
+    for day in jobs:
+        try:
+            if day == today or journal.pending(day) or not (CAPTURES / "digests" / f"{day}.json").exists():
+                nightly(day)
+            if day == today:
+                done.add(f"{day}+early")
+            elif day < yesterday:          # yesterday can still get a late moment (judged after midnight)
+                done.add(day)
+        except Exception as e:
+            log(f"每晚整理 {day} 失败 {type(e).__name__}: {e}，一分钟后再试")
+
+
+def nightly_loop():
+    done = set()
+    while True:
+        nightly_tick(done)
+        time.sleep(60)
 
 
 if __name__ == "__main__":
     stations, title = load_stations()
-    print(f"Loci relay · {title} · {len(stations)} 站 · 判定 {judge_backend()} · 模型 {MODEL}")
-    print(f"浏览器打开 http://localhost:{PORT}/ ；设备填这台电脑的 IP:{PORT}（ipconfig getifaddr en0）")
+    threading.Thread(target=nightly_loop, daemon=True).start()
+    print(f"Loci relay · {title} · {len(stations)} 站 · 判定 {judge_backend()} · 模型 {MODEL}"
+          f" · 路线 {len(route_files())} 条 · 密钥 {'开' if LOCI_KEY else '关'} · 每晚 {PRUNE_AT} 整理")
+    print(f"浏览器打开 http://localhost:{PORT}/ ；" + ("设备填这台电脑的 IP:{PORT}（ipconfig getifaddr en0）".format(PORT=PORT)
+          if HOST == "0.0.0.0" else f"只听 {HOST}：局域网连不上，手机走隧道"))
     serve().serve_forever()

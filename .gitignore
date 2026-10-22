@@ -47,3 +47,4 @@ node_modules/
 .keep
 src/glasses/config.js
 src/glasses/.aix/
+specs/
