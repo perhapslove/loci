@@ -579,6 +579,18 @@ class RelayTest(unittest.TestCase):
             os.remove(one)
         self.assertEqual((st, s["route"], s["riddle"]), (200, "t-one", "唯一一站"))
 
+    def test_talk_from_the_old_route_does_not_follow_into_the_new_one(self):
+        relay.tts_wav = lambda text: FAKE_WAV
+        def answers_while_someone_switches(prompt):
+            self.req("POST", "/api/v1/route", json.dumps({"route": "t-wander"}), {"Content-Type": "application/json"})
+            return "这一站的牌子在桥边"
+        relay.ask_text = answers_while_someone_switches
+        _, r = self.req("POST", "/api/v1/talk?device=phone-t2", json.dumps({"text": "提示一下"}),
+                        {"Content-Type": "application/json"})
+        self.assertIn("路线换了", r["reply"])                              # the late answer is dropped
+        self.assertNotIn("phone-t2", relay.talks)                           # no old-city memory in the new route
+        self.assertEqual(relay.journal.day()[-1]["route"], "stations")      # filed under what it was about
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))

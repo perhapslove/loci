@@ -520,10 +520,12 @@ def hear(audio: bytes) -> str:
     return transcribe(pcm)
 
 
-def spirit_reply(heard: str, device_id: str) -> str:
-    """The spirit's answer: knows the route and where the player is; on a quest it hints, never answers."""
+def spirit_reply(heard: str, device_id: str) -> tuple[str, str]:
+    """The spirit's answer and the route it was about: knows the route and where the player is; on a quest
+    it hints, never answers. If the route is switched while the model thinks, the answer is dropped."""
     with lock:
         path, idx, solved = Path(state["route"]), state["station"], state["station"] in state["solved"]
+        epoch = state["epoch"]
         history = list(talks.get(device_id, []))
         last = (state.get("verdict") or {}).get("text", "")
     route = load_route(path)
@@ -540,8 +542,10 @@ def spirit_reply(heard: str, device_id: str) -> str:
     reply = ask_text(f"{spirit}\n{where}\n{past}玩家：{heard}\n地灵：")
     reply = " ".join(reply.split()).removeprefix("地灵：").strip("「」\"' ")[:80] or "嗯，我在听。"
     with lock:
+        if state["epoch"] != epoch:          # another route now: don't carry this city's talk into it
+            return "路线换了，刚才那句不算，再问我一次。", route["code"]
         talks[device_id] = (history + [(heard, reply)])[-3:]
-    return reply
+    return reply, route["code"]
 
 
 def watcher_talk(pcm: bytes, device_id: str) -> bytes:
@@ -556,7 +560,7 @@ def watcher_talk(pcm: bytes, device_id: str) -> bytes:
             reply = "我还听不懂说话，等我学会了再聊。"
         else:
             heard = transcribe(pcm)
-            reply = spirit_reply(heard, device_id) if heard else "我没听清，再说一遍？"
+            reply = spirit_reply(heard, device_id)[0] if heard else "我没听清，再说一遍？"
     except Exception as e:
         log(f"语音对话出错 {type(e).__name__}: {e}")
         reply = "我刚才走神了，再说一遍好吗？"
@@ -872,18 +876,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log(f"听不了录音 {type(e).__name__}: {e}")
                 text = ""
-            kept = None
+            kept, about = None, None
             try:
                 if text and any(w in text.lower() for w in KEEP_WORDS):
                     kept = journal.keep(dev)
                     reply = keep_reply(kept)
+                elif text:
+                    reply, about = spirit_reply(text, dev)
                 else:
-                    reply = spirit_reply(text, dev) if text else "我没听清，再说一遍？"
+                    reply = "我没听清，再说一遍？"
             except Exception as e:
                 log(f"地灵回话失败 {type(e).__name__}: {e}")
                 reply = "我刚才走神了，再说一遍好吗？"
             if text:
-                journal.add(load_route()["code"], "talk", dev, heard=text, said=reply,
+                journal.add(about or load_route()["code"], "talk", dev, heard=text, said=reply,
                             lat=self.query_float(query, "lat"), lon=self.query_float(query, "lon"))
             log(f"地灵对话（{dev}）听到={text[:30]!r} 回={reply[:30]!r}")
             return self.send(200, {"heard": text, "reply": reply, "say": reply, "voice": voice_url(reply),
