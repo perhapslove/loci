@@ -713,7 +713,10 @@ class Handler(BaseHTTPRequestHandler):
                 total += size
                 if total > MAX_BODY:
                     raise ValueError("body too large")
-                chunks.append(self.rfile.read(size))
+                chunk = self.rfile.read(size)
+                if len(chunk) != size:
+                    raise ValueError("connection closed mid-body")
+                chunks.append(chunk)
                 self.rfile.readline(1024)      # CRLF after each chunk
             return b"".join(chunks)
         n = int(self.headers.get("Content-Length", "0") or 0)
@@ -721,7 +724,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("negative length")
         if n > MAX_BODY:
             raise ValueError("body too large")
-        return self.rfile.read(n) if n else b""
+        body = self.rfile.read(n) if n else b""
+        if len(body) != n:
+            raise ValueError("connection closed mid-body")
+        return body
 
     def ip(self) -> str:
         return self.client_address[0] if self.client_address else ""

@@ -614,6 +614,15 @@ class RelayTest(unittest.TestCase):
         finally:
             relay.PRUNE_AT = real_at
 
+    def test_a_photo_from_just_before_midnight_can_still_be_kept(self):
+        yesterday = time.strftime("%Y%m%d", time.localtime(time.time() - 86400))
+        m = relay.journal.add("t-mid", "look", "phone-k2", photo=f"{yesterday}-235959-999-0009.jpg", people=False)
+        self.assertEqual(relay.journal.keep("phone-k2", m["id"])["id"], m["id"])
+
+    def test_a_body_shorter_than_promised_is_refused(self):
+        head = b"POST /api/v1/log HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n\r\nabc"
+        self.assertTrue(self.raw(head, half_close=True).startswith(b"HTTP/1.1 400"))
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))

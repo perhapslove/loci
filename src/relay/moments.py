@@ -72,10 +72,12 @@ class Journal:
         return sorted(out, key=lambda m: m["t"])
 
     def keep(self, device: str, moment_id: str | None = None) -> dict | None:
-        """Mark a moment as kept: the given one, or this device's latest look or judgement today (any route)."""
+        """Mark a moment as kept: the given one, or this device's latest look or judgement (any route). Looks
+        back to yesterday too: a photo taken just before midnight is filed under the day it was taken."""
+        days = (time.strftime("%Y%m%d"), time.strftime("%Y%m%d", time.localtime(time.time() - 86400)))
         with self.lock:
             best = None
-            for path in self.runs.glob(f"{time.strftime('%Y%m%d')}-*/moments.jsonl"):
+            for path in (p for d in days for p in self.runs.glob(f"{d}-*/moments.jsonl")):
                 for i, m in enumerate(self._read(path)):
                     hit = m["id"] == moment_id if moment_id else (m["device"] == device and m["kind"] in ("look", "judge"))
                     if hit and (best is None or m["t"] > best[2]["t"]):
