@@ -677,6 +677,26 @@ class RelayTest(unittest.TestCase):
         story = relay.unlocked_text(relay.load_route()["stations"][0], {})
         self.assertEqual((m["match"], m["said"]), (True, story))
 
+    def test_two_quick_verdicts_by_hand_are_recorded_in_order(self):
+        relay.ask_model = lambda jpeg, station, path: {"match": False, "text": "不像", "people": False, "source": "test"}
+        relay.tts_wav = lambda text: FAKE_WAV
+        self.req("POST", "/api/v1/photo?device=phone-q2", JPEG, {"Content-Type": "image/jpeg"})
+        real = relay.journal.judged
+        def slow_yes(photo, match, said=None):
+            if match:
+                time.sleep(0.3)                                          # the "yes" is slow to reach the disk
+            return real(photo, match, said)
+        relay.journal.judged = slow_yes
+        try:
+            first = threading.Thread(target=self.req, args=("POST", "/judge?ok=1"))
+            first.start()
+            time.sleep(0.05)
+            self.req("POST", "/judge?ok=0")                               # then the person changes their mind
+            first.join()
+        finally:
+            relay.journal.judged = real
+        self.assertEqual((relay.state["solved"], relay.journal.day()[-1]["match"]), ([], False))
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))

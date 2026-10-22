@@ -1062,8 +1062,8 @@ class Handler(BaseHTTPRequestHandler):
                 photo = state["photo"]
                 stations = load_route(Path(state["route"]))["stations"]
                 station = stations[state["station"]] if state["station"] < len(stations) else {}
-            if photo:   # the record says what the person decided, not the model's reason any more
-                journal.judged(photo, ok, unlocked_text(station, {}) if ok else MANUAL_NO)
+                if photo:   # same lock as the state change: two quick verdicts are recorded in order
+                    journal.judged(photo, ok, unlocked_text(station, {}) if ok else MANUAL_NO)
             log(f"人工判定 {ok}")
             return self.send(200, {"ok": True})
         if path == "/station":
