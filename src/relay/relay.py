@@ -383,11 +383,12 @@ def unlocked_text(station: dict, verdict: dict) -> str:
 
 
 def compact_state() -> dict:
-    route = load_route()
-    stations = route["stations"]
-    with lock:
-        idx, v, solved = state["station"], state["verdict"], list(state["solved"])
+    with lock:                                   # one consistent view: route, station, verdict together
+        path, idx, v, solved = Path(state["route"]), state["station"], state["verdict"], list(state["solved"])
         devices = {k: dict(d) for k, d in state["devices"].items()}
+    route = load_route(path)
+    stations = route["stations"]
+    idx = min(idx, max(len(stations) - 1, 0))    # in case the route file was edited while playing
     base = {"title": route.get("title", "Loci"), "route": route["code"], "mode": route["mode"],
             "city": route.get("city", ""), "verdict": v, "devices": devices}
     if not stations:                                 # wander: no stations, nothing to solve
@@ -521,12 +522,13 @@ def hear(audio: bytes) -> str:
 
 def spirit_reply(heard: str, device_id: str) -> str:
     """The spirit's answer: knows the route and where the player is; on a quest it hints, never answers."""
-    route = load_route()
-    stations, spirit = route["stations"], route.get("spirit") or SPIRIT   # a route may set its own voice
     with lock:
-        idx, solved = state["station"], state["station"] in state["solved"]
+        path, idx, solved = Path(state["route"]), state["station"], state["station"] in state["solved"]
         history = list(talks.get(device_id, []))
         last = (state.get("verdict") or {}).get("text", "")
+    route = load_route(path)
+    stations, spirit = route["stations"], route.get("spirit") or SPIRIT   # a route may set its own voice
+    idx = min(idx, max(len(stations) - 1, 0))
     if not stations:
         where = f"玩家在{route.get('city') or '城里'}随便走走。" + (f"你刚才看到并说过：{last}" if last else "")
     elif solved:
@@ -699,6 +701,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("no chunk size")
                     continue
                 size = int(size_line.split(b";")[0], 16)
+                if size < 0:
+                    raise ValueError("negative chunk size")
                 if size == 0:
                     self.rfile.readline(1024)  # trailing CRLF after the last chunk
                     break
@@ -804,10 +808,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self.send(200, PAGE, "text/html; charset=utf-8")
         if path == "/state":
-            stations, title = load_stations()
             with lock:
                 snap = json.loads(json.dumps(state))
-            snap.update(stations=stations, title=title)
+            route = load_route(Path(snap["route"]))
+            snap.update(stations=route["stations"], title=route.get("title", "Loci"))
             return self.send(200, snap)
         if path == "/api/v1/state":
             if "device=" in self.path or self.headers.get("X-Device"):
@@ -923,8 +927,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True})
 
         if path == "/api/v1/next":                  # any client: move on, but only from a solved station
-            stations, _ = load_stations()
-            with lock:
+            with lock:                              # the route is read under the same lock that moves the station
+                stations = load_route(Path(state["route"]))["stations"]
                 if state["station"] in state["solved"] and state["station"] < len(stations) - 1:
                     state["station"] += 1
                     # a new station starts without a photo: the last one was evidence for the station before
@@ -1036,9 +1040,9 @@ class Handler(BaseHTTPRequestHandler):
             log(f"人工判定 {ok}")
             return self.send(200, {"ok": True})
         if path == "/station":
-            stations, _ = load_stations()
             d = -1 if "d=-1" in query else 1
             with lock:
+                stations = load_route(Path(state["route"]))["stations"]
                 state["station"] = max(0, min(len(stations) - 1, state["station"] + d))
                 state.update(verdict=None, photo=None, photo_from=None)
             return self.send(200, {"ok": True})

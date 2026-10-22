@@ -552,6 +552,33 @@ class RelayTest(unittest.TestCase):
             relay.load_route = real
         self.assertEqual(relay.state["solved"], [])                     # the old question can't solve the new route
 
+    def test_a_negative_chunk_size_is_refused(self):
+        head = (b"POST /api/v1/log HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"-1\r\n" + b"x" * 64)
+        self.assertTrue(self.raw(head).startswith(b"HTTP/1.1 400"))
+
+    def test_progress_never_mixes_two_routes(self):
+        one = os.path.join(ROUTES, "t-one.json")
+        with open(one, "w") as f:
+            json.dump({"title": "一站", "stations": [{"riddle": "唯一一站", "target": "门"}]}, f)
+        with relay.lock:
+            relay.state.update(route=one, station=0, solved=[])
+        real, switched = relay.load_route, []
+        def load_then_someone_moves(path=None):
+            route = real(path)
+            if not switched:                         # another request: a 3-station route, on station 3
+                switched.append(1)
+                with relay.lock:
+                    relay.state.update(route=str(relay.STATIONS_FILE), station=2, solved=[])
+            return route
+        relay.load_route = load_then_someone_moves
+        try:
+            st, s = self.req("GET", "/api/v1/state")
+        finally:
+            relay.load_route = real
+            os.remove(one)
+        self.assertEqual((st, s["route"], s["riddle"]), (200, "t-one", "唯一一站"))
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))
