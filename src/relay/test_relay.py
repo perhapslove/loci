@@ -623,6 +623,40 @@ class RelayTest(unittest.TestCase):
         head = b"POST /api/v1/log HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n\r\nabc"
         self.assertTrue(self.raw(head, half_close=True).startswith(b"HTTP/1.1 400"))
 
+    def test_a_photo_from_before_a_route_switch_is_not_shown_on_the_new_route(self):
+        relay.ask_model = lambda jpeg, station, path: {"match": False, "text": "不是", "people": False, "source": "test"}
+        relay.tts_wav = lambda text: FAKE_WAV
+        real, switched = relay.load_route, []
+        def load_then_someone_switches(path=None):
+            route = real(path)
+            if not switched:
+                switched.append(1)
+                with relay.lock:
+                    relay.state.update(route=os.path.join(ROUTES, "t-wander.json"), station=0, solved=[],
+                                       photo=None, verdict=None, epoch=relay.state["epoch"] + 1)
+            return route
+        relay.load_route = load_then_someone_switches
+        try:
+            self.req("POST", "/api/v1/photo?device=phone-p2", JPEG, {"Content-Type": "image/jpeg"})
+        finally:
+            relay.load_route = real
+        self.assertIsNone(relay.state["photo"])
+
+    def test_a_verdict_by_hand_right_after_the_model_reaches_the_record(self):
+        relay.ask_model = lambda jpeg, station, path: {"match": True, "text": "找到了", "people": False, "source": "test"}
+        relay.tts_wav = lambda text: FAKE_WAV
+        real_judge = relay.judge
+        def model_then_a_person(*args):
+            v = real_judge(*args)
+            self.req("POST", "/judge?ok=0")                               # lands before the record is written
+            return v
+        relay.judge = model_then_a_person
+        try:
+            self.req("POST", "/api/v1/photo?device=phone-j2", JPEG, {"Content-Type": "image/jpeg"})
+        finally:
+            relay.judge = real_judge
+        self.assertEqual((relay.state["solved"], relay.journal.day()[-1]["match"]), ([], False))
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))

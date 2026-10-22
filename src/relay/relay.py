@@ -329,7 +329,8 @@ def see(jpeg: bytes, device_id: str, lat=None, lon=None, taken=None, taken_route
     (CAPTURES / fname).write_bytes(jpeg)
     if not elsewhere:
         with lock:
-            state.update(photo=fname, photo_at=time.time(), photo_from=device_id, verdict=None)
+            if state["epoch"] == epoch:          # still the play-through this photo was taken in
+                state.update(photo=fname, photo_at=time.time(), photo_from=device_id, verdict=None)
     describe = route["mode"] == "wander" or elsewhere
     log(f"收到照片 {len(jpeg) // 1024}KB 来自 {device_id}" + ("（补传，拍在别的路线/站）" if elsewhere else "（漫游）" if describe else ""))
     if describe:
@@ -342,9 +343,13 @@ def see(jpeg: bytes, device_id: str, lat=None, lon=None, taken=None, taken_route
         log(f"漫游看图 · {say[:30]} · 有人={people_in(v)} · {v.get('source')}")
         return {"verdict": v, "say": say, "moment": m["id"]}
     v = judge(fname, jpeg, route["stations"], idx, epoch, already_solved)
-    say = unlocked_text(route["stations"][idx], v) if v.get("match") is True else (v.get("text") or "")
-    m = journal.add(route["code"], "judge", device_id, photo=fname, match=v.get("match"), said=say,
-                    people=people_in(v), station=idx + 1, **where)
+    with lock:      # recorded under the same lock /judge uses, so a verdict by hand can't fall in between
+        cur = state["verdict"] or {}
+        if state["photo"] == fname and cur.get("source") == "manual":
+            v = {**v, "match": cur["match"], "source": "manual"}
+        say = unlocked_text(route["stations"][idx], v) if v.get("match") is True else (v.get("text") or "")
+        m = journal.add(route["code"], "judge", device_id, photo=fname, match=v.get("match"), said=say,
+                        people=people_in(v), station=idx + 1, **where)
     return {"verdict": v, "say": say, "moment": m["id"]}
 
 
