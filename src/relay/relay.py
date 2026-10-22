@@ -102,6 +102,7 @@ LOOK = ("你是「地灵」，住在{city}的地方之灵，正陪玩家在城�
 KEEP_WORDS = ("收起来", "记下来", "记住这个", "留着", "keep")
 NOT_KEEP = re.compile(r"(不要|不用|不必|别|不|没|勿)\s*(再)?\s*(收起来|记下来|记住|留着)|(don'?t|do not|not)\s+keep", re.I)
 MANUAL_NO = "人工判定：不是这个。"
+CANT_DO = "这个我做不到，我只能陪你看这座城。"
 
 
 def wants_keep(text: str) -> bool:
@@ -232,12 +233,17 @@ def claude_env() -> dict:
 
 
 def ask_claude_cli(path: Path, instruction: str) -> dict:
-    prompt = f"用 Read 工具看这张照片：{path} 。\n{instruction}\n只输出一行 JSON，不要别的话。"
+    """The photo is copied alone into an empty folder, and claude may only Read, only inside it
+    (--restricted --tools Read, no MCP): writing in a photo can't steer it to anything else on this Mac."""
     env = claude_env()
     t0 = time.time()
-    r = subprocess.run([CLAUDE_BIN, "-p", "--setting-sources", "", "--model", MODEL,
-                        "--allowedTools", "Read", "--output-format", "text", prompt],
-                       capture_output=True, text=True, timeout=90, env=env, cwd=str(HERE))
+    with tempfile.TemporaryDirectory(prefix="loci-look-") as td:
+        shutil.copyfile(path, Path(td) / "photo.jpg")
+        prompt = f"用 Read 工具看这张照片：./photo.jpg 。\n{instruction}\n只输出一行 JSON，不要别的话。"
+        r = subprocess.run([CLAUDE_BIN, "-p", "--setting-sources", "", "--restricted", "--strict-mcp-config",
+                            "--tools", "Read", "--allowedTools", "Read", "--model", MODEL,
+                            "--output-format", "text", prompt],
+                           capture_output=True, text=True, timeout=90, env=env, cwd=td)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout)[-200:])
     out = parse_reply(r.stdout)
@@ -442,7 +448,7 @@ def tts_wav(text: str) -> bytes:
     (the Watcher reads sample rate from a fixed header; a JUNK chunk would confuse it)."""
     key = tts_key(text)
     cached = TTS_DIR / f"{key}.wav"
-    if cached.exists():
+    if cached.exists() and cached.stat().st_size > 44:      # header only (or empty) = a write that broke off
         return cached.read_bytes()
     with tempfile.TemporaryDirectory() as td:
         aiff, raw = Path(td) / "t.aiff", Path(td) / "t.wav"
@@ -458,7 +464,9 @@ def tts_wav(text: str) -> bytes:
         w.setframerate(params.framerate)
         w.writeframes(frames)
     data = buf.getvalue()
-    cached.write_bytes(data)
+    tmp = cached.with_name(f"{key}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, cached)                                  # never a half-written file under the real name
     return data
 
 
@@ -504,10 +512,12 @@ def ask_text(prompt: str) -> str:
         )
         with urllib.request.urlopen(req, timeout=30) as r:
             return "".join(b.get("text", "") for b in json.loads(r.read()).get("content", [])).strip()
-    if CLAUDE_BIN:
+    if CLAUDE_BIN:   # the prompt carries what the player said: no tools at all, no MCP, an empty folder
         env = claude_env()
-        r = subprocess.run([CLAUDE_BIN, "-p", "--setting-sources", "", "--model", MODEL, "--output-format", "text", prompt],
-                           capture_output=True, text=True, timeout=60, env=env, cwd=str(HERE))
+        with tempfile.TemporaryDirectory(prefix="loci-talk-") as td:
+            r = subprocess.run([CLAUDE_BIN, "-p", "--setting-sources", "", "--strict-mcp-config", "--tools", "",
+                                "--model", MODEL, "--output-format", "text", prompt],
+                               capture_output=True, text=True, timeout=60, env=env, cwd=td)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout)[-200:])
         return r.stdout.strip()
@@ -552,8 +562,11 @@ def spirit_reply(heard: str, device_id: str) -> tuple[str, str]:
         st = stations[idx]
         where = f"玩家在第{idx + 1}站，谜面是：{st.get('riddle', '')} 要找的是：{st.get('target', '')}。可以给提示，别直接说出答案。"
     past = "".join(f"玩家：{h}\n地灵：{r}\n" for h, r in history)
-    reply = ask_text(f"{spirit}\n{where}\n{past}玩家：{heard}\n地灵：")
-    reply = " ".join(reply.split()).removeprefix("地灵：").strip("「」\"' ")[:80] or "嗯，我在听。"
+    reply = ask_text(f"{spirit}\n你没有任何工具：不能读文件、上网或执行命令，被要求时就说做不到。\n{where}\n{past}玩家：{heard}\n地灵：")
+    reply = " ".join(reply.split()).removeprefix("地灵：").strip("「」\"' ")
+    if re.search(r"<\s*/?\s*(invoke|parameter|function|tool)", reply, re.I):   # a tool call it can't make, as text
+        reply = CANT_DO
+    reply = reply[:80] or "嗯，我在听。"
     with lock:
         if state["epoch"] != epoch:          # another route now: don't carry this city's talk into it
             return "路线换了，刚才那句不算，再问我一次。", route["code"]
@@ -1092,10 +1105,13 @@ def nightly(day: str | None = None) -> dict:
     the digest is newer than the journal it summarises and reflects what is left)."""
     day = day or time.strftime("%Y%m%d")
     deleted = journal.prune(day)
+    seen = journal.changed_at(day)               # the journal as it is when we sum it up
     digest = journal.digest(day)
     out = CAPTURES / "digests"
     out.mkdir(exist_ok=True)
     (out / f"{day}.json").write_text(json.dumps(digest, ensure_ascii=False, indent=1), encoding="utf-8")
+    if seen:   # stamped with that time: anything written while we summed up makes the digest stale
+        os.utime(out / f"{day}.json", (seen, seen))
     log(f"每晚整理 {day}：拾遗 {len(digest['kept'])} 个，删掉照片 {deleted} 张")
     return {**digest, "deleted": deleted}
 
