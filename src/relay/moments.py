@@ -90,8 +90,9 @@ class Journal:
             self._write(path, moments)
             return moments[i]
 
-    def judged(self, photo: str, match) -> dict | None:
-        """A person overruled the model on this photo (the operator page's buttons)."""
+    def judged(self, photo: str, match, said: str | None = None) -> dict | None:
+        """A person overruled the model on this photo (the operator page's buttons); `said` replaces the
+        model's reason, so the record doesn't contradict itself."""
         day = photo[:8] if photo[:8].isdigit() else time.strftime("%Y%m%d")
         with self.lock:
             for path in self.runs.glob(f"{day}-*/moments.jsonl"):
@@ -99,6 +100,8 @@ class Journal:
                 for m in moments:
                     if m.get("photo") == photo and m["kind"] == "judge":
                         m["match"], m["by"] = match, "manual"
+                        if said is not None:
+                            m["said"] = said
                         self._write(path, moments)
                         return m
         return None

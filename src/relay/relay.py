@@ -100,6 +100,14 @@ LOOK = ("你是「地灵」，住在{city}的地方之灵，正陪玩家在城�
         "不确定就只说你看到了什么，不要编历史和名字。另外判断照片里有没有能认出脸的人。"
         "只输出 JSON：{{\"text\": \"要念给玩家听的话\", \"people\": true 或 false}}")
 KEEP_WORDS = ("收起来", "记下来", "记住这个", "留着", "keep")
+NOT_KEEP = re.compile(r"(不要|不用|不必|别|不|没|勿)\s*(再)?\s*(收起来|记下来|记住|留着)|(don'?t|do not|not)\s+keep", re.I)
+MANUAL_NO = "人工判定：不是这个。"
+
+
+def wants_keep(text: str) -> bool:
+    """"收起来" keeps; "不要收起来" / "别留着" / "don't keep" don't."""
+    low = text.lower()
+    return any(w in low for w in KEEP_WORDS) and not NOT_KEEP.search(low)
 
 # The devices this project expects; the web page shows a slot for each.
 DEVICE_KINDS = {
@@ -346,7 +354,7 @@ def see(jpeg: bytes, device_id: str, lat=None, lon=None, taken=None, taken_route
     with lock:      # recorded under the same lock /judge uses, so a verdict by hand can't fall in between
         cur = state["verdict"] or {}
         if state["photo"] == fname and cur.get("source") == "manual":
-            v = {**v, "match": cur["match"], "source": "manual"}
+            v = {**v, "match": cur["match"], "source": "manual", "text": "" if cur["match"] else MANUAL_NO}
         say = unlocked_text(route["stations"][idx], v) if v.get("match") is True else (v.get("text") or "")
         m = journal.add(route["code"], "judge", device_id, photo=fname, match=v.get("match"), said=say,
                         people=people_in(v), station=idx + 1, **where)
@@ -889,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
                 text = ""
             kept, about = None, None
             try:
-                if text and any(w in text.lower() for w in KEEP_WORDS):
+                if text and wants_keep(text):
                     kept = journal.keep(dev)
                     reply = keep_reply(kept)
                 elif text:
@@ -1052,8 +1060,10 @@ class Handler(BaseHTTPRequestHandler):
                     state["solved"].remove(state["station"])
                 state["epoch"] += 1                                    # and any judgement still running
                 photo = state["photo"]
-            if photo:
-                journal.judged(photo, ok)
+                stations = load_route(Path(state["route"]))["stations"]
+                station = stations[state["station"]] if state["station"] < len(stations) else {}
+            if photo:   # the record says what the person decided, not the model's reason any more
+                journal.judged(photo, ok, unlocked_text(station, {}) if ok else MANUAL_NO)
             log(f"人工判定 {ok}")
             return self.send(200, {"ok": True})
         if path == "/station":

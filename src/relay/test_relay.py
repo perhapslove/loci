@@ -657,6 +657,26 @@ class RelayTest(unittest.TestCase):
             relay.judge = real_judge
         self.assertEqual((relay.state["solved"], relay.journal.day()[-1]["match"]), ([], False))
 
+    def test_saying_dont_keep_does_not_keep(self):
+        relay.tts_wav = lambda text: FAKE_WAV
+        relay.ask_model = lambda jpeg, station, path: {"text": "门", "people": False, "source": "test"}
+        relay.ask_text = lambda prompt: "好，不收。"
+        self.wander()
+        self.req("POST", "/api/v1/photo?device=phone-nk", JPEG, {"Content-Type": "image/jpeg"})
+        _, r = self.req("POST", "/api/v1/talk?device=phone-nk", json.dumps({"text": "这个不要收起来"}),
+                        {"Content-Type": "application/json"})
+        self.assertIsNone(r["kept"])
+        self.assertFalse([m for m in relay.journal.day() if m["device"] == "phone-nk"][0]["kept"])
+
+    def test_a_verdict_by_hand_replaces_the_models_reason(self):
+        relay.ask_model = lambda jpeg, station, path: {"match": False, "text": "你拍的不是目标", "people": False, "source": "test"}
+        relay.tts_wav = lambda text: FAKE_WAV
+        self.req("POST", "/api/v1/photo?device=phone-mr", JPEG, {"Content-Type": "image/jpeg"})
+        self.req("POST", "/judge?ok=1")
+        m = relay.journal.day()[-1]
+        story = relay.unlocked_text(relay.load_route()["stations"][0], {})
+        self.assertEqual((m["match"], m["said"]), (True, story))
+
     def test_keep_reply_tells_people_from_unknown(self):
         self.assertIn("照片里有人", relay.keep_reply({"people": True}))
         self.assertIn("没看清", relay.keep_reply({"people": None}))
