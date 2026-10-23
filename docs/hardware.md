@@ -2,6 +2,10 @@
 
 What each device can do for Loci, checked against vendor docs and firmware source (Oct 2026). If something here disagrees with the device in your hand, trust the device.
 
+## Phones — any browser
+
+The relay serves a phone client at `/play` (`src/phone/index.html`). It uses the browser's camera (`<input capture>`), microphone (`MediaRecorder`; AAC on iPhone, Opus elsewhere — the relay converts with `ffmpeg`) and location. All three need HTTPS, so phones reach the relay through a tunnel. When the relay can't be reached, photos wait in the browser (IndexedDB) until the end of the day they were taken and are sent when it answers again.
+
 ## Seeed SenseCAP Watcher (W1-A) — the creature's body
 
 | | |
@@ -49,9 +53,11 @@ Sources: <https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/>, <https://
 - In USB HID mode the serial port disappears; to flash again, hold BOOT while plugging in.
 - Peel the protective film off the lens.
 
-## Rokid AI glasses — planned
+## Rokid AI glasses
 
-Most likely the display model (binocular green monochrome display, 12 MP camera). Two official developer routes work with an iPhone:
+Status: an AIUI agent (`src/glasses/`) runs on the display model (RV101, binocular green monochrome display, 12 MP camera) through the global Hi Rokid app and talks to the relay over HTTPS. Taking photos on real glasses is not verified yet. Each change on the glasses side means re-importing the agent in AIUI Studio and updating it in the phone app, so game logic lives in the relay.
+
+Two official developer routes work with an iPhone:
 
 - **AIUI Studio** — agents written in JS with a mini-program-like markup, tested in a web simulator, then pushed to the glasses through the phone app. <https://github.com/yodaos-project/AIUI>
 - **CXR-L SDK for iOS** — `RGCxrClient` on CocoaPods: push custom UI to the lens, take photos, get audio.

@@ -15,12 +15,27 @@ cd src/relay
 python3 relay.py
 ```
 
-Open <http://localhost:8787/>. You should see the first station of the demo route, and three device slots at the top — Watcher, XIAO, glasses. Each slot turns green the moment that device reaches the relay, so connect them one at a time and watch.
+Open <http://localhost:8787/>. You should see the first station of the demo route, and device slots at the top — Watcher, XIAO, glasses, phone. Each slot turns green the moment that device reaches the relay, so connect them one at a time and watch.
 Find the Mac's address on the shared network — devices will need it:
 
 ```sh
 ipconfig getifaddr en0      # e.g. 172.20.10.2
 ```
+
+## 2. Play on a phone (quickest)
+
+A phone browser only gets camera, microphone and location over HTTPS, so publish the relay through a tunnel:
+
+```sh
+LOCI_KEY=<a long random string> RELAY_HOST=127.0.0.1 python3 relay.py
+cloudflared tunnel --url http://localhost:8787     # prints https://<random>.trycloudflare.com
+```
+
+Open `https://<random>.trycloudflare.com/play#key=<LOCI_KEY>` on the phone — in Safari on iPhone, not inside a chat app's browser, which may not allow the microphone or Add to Home Screen. The key stays in the link, so **Add to Home Screen** gives an icon that keeps working.
+
+- `RELAY_HOST=127.0.0.1` keeps people on the same Wi-Fi out; only the tunnel reaches the relay. Leave it out if Watcher or XIAO devices on your LAN need to connect.
+- If the tunnel keeps dropping, try `protocol: http2` in a cloudflared config file; if cloudflared exits because it can't find Cloudflare's edge (some routers don't answer DNS SRV lookups), add `--edge region1.v2.argotunnel.com:7844`.
+- A quick tunnel's address changes every time it restarts; use a named tunnel for a fixed one.
 
 ## 2a. Connect a SenseCAP Watcher
 
